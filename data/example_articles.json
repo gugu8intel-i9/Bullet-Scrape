@@ -1,0 +1,32 @@
+{
+  "name": "news_articles",
+  "url": "https://example-news.com/section/tech",
+  "method": "GET",
+  "queries": {
+    "articles": {
+      "name": "articles",
+      "selector": "article.story",
+      "extract": [
+        { "name": "headline", "rule": { "selector": "h2.headline", "text": true, "transform": ["trim"] } },
+        { "name": "url",      "rule": { "attribute": "href", "transform": ["urljoin"] } },
+        { "name": "author",   "rule": { "selector": "span.byline", "text": true, "transform": ["trim"], "optional": true } },
+        { "name": "pub_date", "rule": { "regex": "\\d{4}-\\d{2}-\\d{2}", "aggregate": "first" } },
+        { "name": "tags",     "rule": { "selector": "a.tag", "text": true, "aggregate": "unique", "transform": ["trim", "lowercase"] } }
+      ]
+    }
+  },
+  "pagination": {
+    "type": "next_link",
+    "next_selector": "a.pagination-next",
+    "max_pages": 5
+  },
+  "output": {
+    "format": "jsonl",
+    "path": "articles.jsonl"
+  },
+  "limits": {
+    "max_concurrent": 4,
+    "max_retries": 2,
+    "timeout_ms": 25000
+  }
+}
