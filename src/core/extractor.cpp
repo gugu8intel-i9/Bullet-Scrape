@@ -20,10 +20,19 @@ static std::regex make_regex(const std::string& pattern) {
     }
 }
 
+// Simple regex cache for hot path performance
+static std::unordered_map<std::string, std::regex> regex_cache;
+static const std::regex& get_cached_regex(const std::string& pattern) {
+    auto it = regex_cache.find(pattern);
+    if (it != regex_cache.end()) return it->second;
+    auto re = make_regex(pattern);
+    return regex_cache.emplace(pattern, std::move(re)).first->second;
+}
+
 std::vector<std::string> ExtractionEngine::regex_find_all(
         const std::string& text, const std::string& pattern) {
     std::vector<std::string> out;
-    auto re = make_regex(pattern);
+    const auto& re = get_cached_regex(pattern);
     auto begin = std::sregex_iterator(text.begin(), text.end(), re);
     auto end   = std::sregex_iterator();
     for (auto it = begin; it != end; ++it)
@@ -34,7 +43,7 @@ std::vector<std::string> ExtractionEngine::regex_find_all(
 std::vector<std::vector<std::string>> ExtractionEngine::regex_find_captures(
         const std::string& text, const std::string& pattern, int groups) {
     std::vector<std::vector<std::string>> out;
-    auto re = make_regex(pattern);
+    const auto& re = get_cached_regex(pattern);
     auto begin = std::sregex_iterator(text.begin(), text.end(), re);
     auto end   = std::sregex_iterator();
     for (auto it = begin; it != end; ++it) {
@@ -415,7 +424,7 @@ json ExtractionEngine::apply_aggregate(const json& transformed,
         json result = json::array();
         for (size_t i = 0; i < transformed.size(); ++i) {
             std::string val = transformed[i].is_string()
-                ? transformed[i].get_string()
+                ? transformed[i].get<std::string>()
                 : transformed[i].dump();
             if (seen.insert(val).second)
                 result.push_back(transformed[i]);
