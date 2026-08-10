@@ -117,8 +117,18 @@ void CsvWriter::flush() {
 
 // ── Factory ─────────────────────────────────────────────────────────────────
 
+// Discard writer — used by the C/Python API which captures records in-memory.
+class NullWriter : public OutputWriter {
+public:
+    void write(const Record&) override {}
+    void flush() override {}
+    std::string extension() const override { return ""; }
+};
+
 std::unique_ptr<OutputWriter> make_writer(const OutputConfig& cfg) {
     auto& fmt = cfg.format;
+    if (fmt == "none" || fmt == "null" || fmt == "memory")
+        return std::make_unique<NullWriter>();
     if (fmt == "stdout" || fmt == "json") {
         if (cfg.path.empty() || cfg.path == "stdout")
             return std::make_unique<JsonArrayWriter>("", true);

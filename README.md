@@ -7,33 +7,98 @@ Bullet Scrape is a high-performance C++ web scraping engine built for speed and 
 | Feature | Bullet Scrape |
 |---|---|
 | Language | C++17 |
-| HTTP | libcurl (connection pooling, HTTP/2, retries) |
+| HTTP | libcurl (connection pooling, HTTP/2, gzip, retries) + POSIX fallback |
 | Extraction | Regex (zero-copy) + CSS-selector-lite + XPath (opt-in) |
-| Concurrency | Thread pool, configurable parallelism |
-| Output | JSON · JSONL · CSV · stdout |
+| Concurrency | Bounded worker pool, configurable parallelism |
+| Output | JSON · JSONL · CSV · stdout · memory (C/Python API) |
 | Config | Declarative JSON |
-| Build | CMake, single binary |
+| Bindings | CLI · C API · **Python / Google Colab** |
+| Build | Make / CMake, static + shared library |
 
 ---
 
-## Quick start
+## Google Colab (one cell)
+
+Open the notebook, or paste this into a fresh Colab runtime:
+
+```python
+!git clone --depth 1 https://github.com/gugu8intel-i9/Bullet-Scrape.git
+%cd Bullet-Scrape
+!bash scripts/colab_setup.sh
+
+import bullet_scrape as bs
+print(bs.version(), bs.backend_info())
+
+result = bs.scrape({
+    "url": "https://example.com",
+    "queries": {
+        "links": {
+            "selector": "a",
+            "extract": [
+                {"name": "href", "rule": {"attribute": "href", "transform": ["urljoin"]}},
+                {"name": "text", "rule": {"text": True, "transform": ["trim"]}},
+            ],
+        }
+    },
+    "limits": {"max_concurrent": 8, "timeout_ms": 15000},
+})
+print(result.stats)
+print(result.records)
+# df = result.to_dataframe()   # pandas installed by colab_setup
+```
+
+📓 Full walkthrough (concurrency, benches, pandas):  
+[`notebooks/Bullet_Scrape_Colab.ipynb`](notebooks/Bullet_Scrape_Colab.ipynb)
+
+Python API docs: [`python/README.md`](python/README.md)
+
+### What Colab setup does
+
+1. Installs `g++`, `make`, `libcurl4-openssl-dev`
+2. Compiles `libbullet_scrape.so` at **`-O3 -ffast-math -march=x86-64-v2`**
+3. Enables libcurl → **HTTPS, HTTP/2, gzip, TCP keep-alive**
+4. Installs the `bullet_scrape` Python package (ctypes, no pybind11)
+5. Smoke-tests offline extraction
+
+Typical cold setup: **30–60 s**. Subsequent runs reuse the `.so`.
+
+---
+
+## Quick start (CLI)
 
 ```bash
 # 1. Install dependencies
-sudo apt install -y libcurl4-openssl-dev cmake g++  # Ubuntu/Debian
-brew install curl cmake                               # macOS
+sudo apt install -y libcurl4-openssl-dev cmake g++ make pkg-config  # Ubuntu/Debian
+brew install curl cmake                                               # macOS
 
-# 2. Build
+# 2. Build (Make — simplest)
+make -j$(nproc)          # CLI + static lib
+make shared              # libbullet_scrape.so for Python
+make test
+make bench
+
+# Or CMake
 mkdir build && cd build
-cmake .. -DBULLET_BUILD_TESTS=ON
-make -j$(nproc)
+cmake .. -DCMAKE_BUILD_TYPE=Release -DBULLET_BUILD_TESTS=ON -DBULLET_BUILD_SHARED=ON
+cmake --build . -j$(nproc)
 
 # 3. Generate an example config
-../build/bullet-scrape --example > my_scrape.json
+./bullet-scrape --example > my_scrape.json
 
 # 4. Edit the config, then run
 ./bullet-scrape my_scrape.json
 ```
+
+### Python (local)
+
+```bash
+make shared -j$(nproc)
+pip install -e ./python
+
+python -c "import bullet_scrape as bs; print(bs.version(), bs.backend_info())"
+```
+
+---
 
 ## Config file
 
@@ -149,7 +214,7 @@ Supported types: `url_param` · `next_link` · `offset` · `none`.
 }
 ```
 
-Formats: `json` (array) · `jsonl` (lines) · `csv` (needs `csv_fields`) · `stdout`.
+Formats: `json` (array) · `jsonl` (lines) · `csv` (needs `csv_fields`) · `stdout` · `memory` (C/Python in-process capture).
 
 ## Limits & resilience
 
@@ -167,25 +232,64 @@ Formats: `json` (array) · `jsonl` (lines) · `csv` (needs `csv_fields`) · `std
 ## Building from source
 
 ```bash
+# Make
+make -j$(nproc) shared test
+
+# CMake
 mkdir build && cd build
 cmake .. \
   -DCMAKE_BUILD_TYPE=Release \
   -DBULLET_BUILD_TESTS=ON \
-  -DBULLET_BUILD_BENCH=ON
-make -j$(nproc)
+  -DBULLET_BUILD_SHARED=ON
+cmake --build . -j$(nproc)
 ctest --output-on-failure
 ```
 
-**Windows:** Use vcpkg: `vcpkg install curl nlohmann-json pugixml`
+**Windows:** Use vcpkg: `vcpkg install curl pugixml`
 
 **macOS:** `brew install curl cmake && export CMAKE_PREFIX_PATH=$(brew --prefix curl)`
 
+### C API (for bindings)
+
+```c
+#include "bullet_scrape/c_api.h"
+
+bullet_scraper_t* s = bullet_scraper_create();
+bullet_scraper_load_json(s, "{...}");
+char* json = NULL;
+bullet_stats_t st;
+bullet_scrape_run(s, &json, &st);
+/* use json… */
+bullet_free(json);
+bullet_scraper_destroy(s);
+```
+
+Shared library: `make shared` → `libbullet_scrape.so`.
+
 ## Performance characteristics
 
-- Regex extraction on a 200 KB HTML page: < 1 ms per query (measured on the bench target).
-- DOM-based XPath: 5–15 ms depending on tree size.
-- Network latency is the dominant cost for most targets. Use `max_concurrent` to parallelise across pages.
-- Connection pooling means second+ request to the same host is just the application-round-trip time.
+| Path | Typical cost |
+|---|---|
+| Regex extract, ~90 KB / 500 nodes | ~2–3 ms / page (bench) |
+| Offline Python `bs.extract` same page | ~280 pages/s process throughput |
+| DOM + XPath | 5–15 ms (tree size dependent) |
+| Network | Dominates real scrapes — raise `max_concurrent` |
+
+### High-performance design points
+
+1. **Bounded worker pool** — `max_concurrent` threads, never unbounded `std::async` fan-out.
+2. **Thread-local curl easy handles** — keep-alive + HTTP/2 with no lock on the fetch hot path.
+3. **Token-bucket rate limiter** — optional global `requests_per_second`.
+4. **Thread-safe regex cache** (`shared_mutex`) — compile once, share across workers.
+5. **Zero-DOM default** — scan raw HTML bytes; XPath is opt-in.
+6. **Colab build flags** — `-O3 -ffast-math -funroll-loops -march=x86-64-v2`.
+
+```python
+import os, bullet_scrape as bs
+n = min(32, (os.cpu_count() or 2) * 2)
+result = bs.scrape(cfg, concurrency=n)
+print(result.stats.pages_per_sec, "pages/s")
+```
 
 ## Design principles
 
@@ -194,6 +298,20 @@ ctest --output-on-failure
 3. **Thread-per-connection** — Each worker owns its curl handle; no locks in the hot path.
 4. **Declarative config** — Describe what you want, not how to get it.
 5. **Fail clearly** — Every error is typed (`Config`, `Http`, `Parse`, `Extract`, `Io`, `Timeout`).
+
+## Project layout
+
+```
+Bullet-Scrape/
+├── include/bullet_scrape/   # public C++ headers + c_api.h
+├── src/core/                # engine + C API
+├── src/cli/                 # bullet-scrape binary
+├── python/bullet_scrape/    # ctypes bindings
+├── scripts/colab_setup.sh   # one-shot Colab/Linux installer
+├── notebooks/               # Colab notebook
+├── data/                    # example configs
+└── tests/
+```
 
 ## License
 

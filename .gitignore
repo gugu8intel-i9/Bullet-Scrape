@@ -1,0 +1,45 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+bullet-scrape
+bullet_scrape_tests
+bullet_scrape_bench
+libbullet_scrape.*
+
+# Staged native lib inside the Python package (rebuilt by setup / colab_setup)
+python/bullet_scrape/libbullet_scrape.so
+python/bullet_scrape/libbullet_scrape.so.*
+python/bullet_scrape/libbullet_scrape.dylib
+python/bullet_scrape/*.egg-info/
+python/*.egg-info/
+python/build/
+python/dist/
+*.egg-info/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Output / local configs
+results.json
+results.jsonl
+*.csv
+!data/**
+
+# Third-party fetched headers
+include/third_party/
