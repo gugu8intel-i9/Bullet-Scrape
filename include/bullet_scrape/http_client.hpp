@@ -11,18 +11,25 @@
 #include <functional>
 #include <chrono>
 
-// ── libcurl compatibility shim (when libcurl headers are not available) ──────
-// In production, install libcurl4-openssl-dev and recompile to get full
-// HTTPS, HTTP/2, connection pooling, and gzip support.
-#ifndef HAVE_CURL
+// ── libcurl compatibility ────────────────────────────────────────────────────
+// When built with -DBULLET_HAVE_CURL (or -DHAVE_CURL) and linked against
+// libcurl, the real CURLcode enum is used. Otherwise a minimal shim lets the
+// rest of the codebase compile against the POSIX HTTP fallback.
+#if defined(BULLET_HAVE_CURL) || defined(HAVE_CURL)
+  #include <curl/curl.h>
+  #ifndef HAVE_CURL
+    #define HAVE_CURL 1
+  #endif
+#else
+  #ifndef HAVE_CURL
 enum CURLcode {
     CURLE_OK = 0,
     CURLE_COULDNT_CONNECT = 7,
     CURLE_COULDNT_RESOLVE_HOST = 6,
     CURLE_OPERATION_TIMEDOUT = 28,
+    CURLE_FAILED_INIT = 2,
 };
-constexpr CURLcode CURLE_OK_V = CURLE_OK;
-#define CURLE_OK CURLE_OK_V
+  #endif
 #endif
 
 namespace bullet_scrape {
@@ -41,8 +48,14 @@ struct HttpResponse {
 
 // ── HTTPClient ──────────────────────────────────────────────────────────────
 //
-// Owns a connection pool (shared curl handle) and dispatches requests.
-// Thread-safe: each thread calls `fetch()` which internally uses a pool handle.
+// High-performance HTTP engine:
+//   • libcurl backend (when BULLET_HAVE_CURL): HTTPS, HTTP/2, gzip, keep-alive,
+//     per-thread easy handles for lock-free connection reuse.
+//   • POSIX sockets fallback: plain HTTP only.
+//   • Bounded worker pool (max_concurrent) — never unbounded thread spawn.
+//   • Optional global rate limiter (token bucket).
+//
+// Thread-safe: fetch() / fetch_async() may be called concurrently.
 //
 class HTTPClient {
 public:
@@ -59,7 +72,7 @@ public:
     explicit HTTPClient(const Options& opt);
     ~HTTPClient();
 
-    // Fetch a single URL synchronously (uses a pooled handle)
+    // Fetch a single URL synchronously (uses a pooled/thread-local handle)
     HttpResponse fetch(const std::string& url,
                       const std::string& method   = "GET",
                       const std::string& body      = "",
@@ -67,8 +80,9 @@ public:
                       int max_retries = 0,
                       std::chrono::milliseconds retry_delay = std::chrono::milliseconds(1000));
 
-    // Async batch: dispatch N URLs across the pool, collect results.
-    // `on_done` is called per result (may be on any thread).
+    // Async batch: dispatch N URLs across a bounded worker pool, collect results.
+    // `on_done` is called per result (may be on any worker thread).
+    // Blocks until all URLs have completed.
     using FetchCallback = std::function<void(const HttpResponse&, const std::string& url, const ScrapeError&)>;
     void fetch_async(const std::vector<std::string>& urls,
                      FetchCallback                on_done,

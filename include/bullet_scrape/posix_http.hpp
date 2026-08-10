@@ -21,6 +21,8 @@
 #include <cstring>
 #include <sstream>
 #include <algorithm>
+#include <thread>
+#include <optional>
 
 namespace bullet_scrape {
 
@@ -191,7 +193,6 @@ private:
             std::memcpy(&addr.sin_addr.s_addr, he->h_addr_list[0], he->h_length);
 
             // Connect with timeout
-            auto t0 = std::chrono::steady_clock::now();
             int ret = connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
             if (ret < 0 && errno != EINPROGRESS) {
                 return {HTTPResponse{},

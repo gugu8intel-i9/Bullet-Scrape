@@ -5,6 +5,8 @@
 #include <set>
 #include <sstream>
 #include <iomanip>
+#include <mutex>
+#include <shared_mutex>
 
 namespace bullet_scrape {
 
@@ -20,9 +22,18 @@ static std::regex make_regex(const std::string& pattern) {
     }
 }
 
-// Simple regex cache for hot path performance
+// Thread-safe regex cache for concurrent workers (shared_mutex = many readers).
+// Patterns are stable for a job, so the hot path is almost always a shared lock hit.
 static std::unordered_map<std::string, std::regex> regex_cache;
+static std::shared_mutex regex_cache_mu;
+
 static const std::regex& get_cached_regex(const std::string& pattern) {
+    {
+        std::shared_lock lk(regex_cache_mu);
+        auto it = regex_cache.find(pattern);
+        if (it != regex_cache.end()) return it->second;
+    }
+    std::unique_lock lk(regex_cache_mu);
     auto it = regex_cache.find(pattern);
     if (it != regex_cache.end()) return it->second;
     auto re = make_regex(pattern);
@@ -424,7 +435,7 @@ json ExtractionEngine::apply_aggregate(const json& transformed,
         json result = json::array();
         for (size_t i = 0; i < transformed.size(); ++i) {
             std::string val = transformed[i].is_string()
-                ? transformed[i].get<std::string>()
+                ? transformed[i].get_string()
                 : transformed[i].dump();
             if (seen.insert(val).second)
                 result.push_back(transformed[i]);

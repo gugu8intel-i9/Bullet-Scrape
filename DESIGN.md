@@ -248,37 +248,58 @@ When config is sparse, Bullet Scrape fills in:
 
 ```
 Bullet-Scrape/
-├── CMakeLists.txt           # build system
-├── DESIGN.md               # this file
-├── README.md               # user-facing docs
-├── bench.cpp               # micro-benchmarks
+├── CMakeLists.txt           # build system (static + shared)
+├── Makefile                 # Make build (auto-detects libcurl)
+├── DESIGN.md                # this file
+├── README.md                # user-facing docs
 │
 ├── include/
 │   └── bullet_scrape/
-│       ├── config.hpp      # JSON config types
-│       ├── exceptions.hpp  # error categories
-│       ├── http_client.hpp # libcurl wrapper
-│       ├── parser.hpp      # HTML parsing strategy
-│       ├── extractor.hpp   # query engine
-│       ├── output.hpp      # writers
-│       └── scraper.hpp     # top-level orchestrator
+│       ├── c_api.h          # stable C ABI (Python / other bindings)
+│       ├── config.hpp       # JSON config types
+│       ├── exceptions.hpp   # error categories
+│       ├── http_client.hpp  # libcurl / POSIX HTTP engine
+│       ├── posix_http.hpp   # HTTP-only fallback client
+│       ├── extractor.hpp    # query engine
+│       ├── mini_json.hpp    # embedded JSON (zero deps)
+│       ├── output.hpp       # writers
+│       └── scraper.hpp      # top-level orchestrator
 │
 ├── src/
 │   ├── core/
 │   │   ├── config.cpp
-│   │   ├── http_client.cpp
-│   │   ├── parser.cpp
+│   │   ├── http_client.cpp  # bounded pool + curl / posix
 │   │   ├── extractor.cpp
 │   │   ├── output.cpp
-│   │   └── scraper.cpp
+│   │   ├── scraper.cpp
+│   │   └── c_api.cpp        # C ABI implementation
 │   └── cli/
 │       └── main.cpp
 │
+├── python/
+│   └── bullet_scrape/       # ctypes bindings + build_native
+├── notebooks/
+│   └── Bullet_Scrape_Colab.ipynb
 ├── data/                    # sample configs
-├── examples/               # example targets
-├── tests/                  # unit tests
-└── scripts/                # build/run helpers
+├── tests/                   # unit tests
+└── scripts/
+    └── colab_setup.sh       # Colab / Linux one-shot installer
 ```
+
+## Google Colab / Python bindings
+
+The C API (`c_api.h`) exports a small stable surface:
+
+- `bullet_scraper_create / destroy`
+- `bullet_scraper_load_json / load_file`
+- `bullet_scrape_run` → malloc'd JSON array + `bullet_stats_t`
+- `bullet_scrape_extract` → offline extract (no network)
+- `bullet_http_get` → raw fetch
+
+Python loads `libbullet_scrape.so` via `ctypes` (no pybind11 compile step at
+import). `scripts/colab_setup.sh` installs deps, builds the `.so` at `-O3`, and
+`pip install -e`s the package. See `notebooks/Bullet_Scrape_Colab.ipynb`.
+
 
 ---
 

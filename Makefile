@@ -1,129 +1,146 @@
 # Bullet Scrape — Makefile
 # =========================
-# Builds the library and CLI binary without CMake.
+# Builds the library, CLI, shared lib (C API), and Python extension helpers.
 #
 # Requirements:
 #   g++ >= 8 (C++17)
-#   libcurl (libcurl4-openssl-dev on Debian/Ubuntu)
-#   nlohmann/json — single header, auto-fetched if missing
+#   libcurl (libcurl4-openssl-dev) — strongly recommended for HTTPS
+#   pthread
 #
 # Usage:
-#   make              # build bullet-scrape binary
+#   make              # build bullet-scrape binary + static lib
+#   make shared       # build libbullet_scrape.so (Python / Colab)
 #   make test         # run unit tests
 #   make bench        # run micro-benchmark
-#   make clean        # remove build artifacts
-#   make install      # install to /usr/local
-#   make fetch-json   # download nlohmann/json single header
+#   make colab        # build shared lib optimised for Colab/manylinux
+#   make clean
 
-CXX       := g++
+CXX       ?= g++
 CXXSTD    := -std=c++17
 WARN      := -Wall -Wextra -Wpedantic -Werror=return-type
-OPT       := -O2 -DNDEBUG
+OPT       := -O3 -DNDEBUG -ffast-math -funroll-loops
 #OPT       := -O2 -g -DDEBUG   # uncomment for debug build
+PIC       := -fPIC
+VIS       := -fvisibility=hidden -fvisibility-inlines-hidden
 
 # Detect OS
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
-    CURL_FLAGS := $(shell pkg-config --cflags --libs libcurl 2>/dev/null || echo "-lcurl")
+    SOEXT := dylib
+    SOFLAGS := -dynamiclib -install_name @rpath/libbullet_scrape.$(SOEXT)
+    # Prefer brew curl on macOS
+    BREW_CURL := $(shell brew --prefix curl 2>/dev/null)
+    ifneq ($(BREW_CURL),)
+        CURL_CFLAGS := -I$(BREW_CURL)/include
+        CURL_LIBS   := -L$(BREW_CURL)/lib -lcurl
+    else
+        CURL_CFLAGS := $(shell pkg-config --cflags libcurl 2>/dev/null)
+        CURL_LIBS   := $(shell pkg-config --libs libcurl 2>/dev/null || echo "-lcurl")
+    endif
 else
-    CURL_FLAGS := $(shell pkg-config --cflags --libs libcurl 2>/dev/null || echo "-lcurl")
+    SOEXT := so
+    SOFLAGS := -shared -Wl,-soname,libbullet_scrape.$(SOEXT).1
+    CURL_CFLAGS := $(shell pkg-config --cflags libcurl 2>/dev/null)
+    CURL_LIBS   := $(shell pkg-config --libs libcurl 2>/dev/null || echo "-lcurl")
 endif
 
-# nlohmann/json single-header location
+# Auto-detect libcurl headers (must actually compile — preprocessor -E can lie)
+HAS_CURL := $(shell printf '%s\n' '#include <curl/curl.h>' 'int main(){return 0;}' | $(CXX) -x c++ $(CURL_CFLAGS) -fsyntax-only - 2>/dev/null && echo yes || echo no)
+ifeq ($(HAS_CURL),yes)
+    CURL_DEFS  := -DBULLET_HAVE_CURL -DHAVE_CURL
+    CURL_LINK  := $(CURL_LIBS)
+    BACKEND_MSG := libcurl
+else
+    CURL_DEFS  :=
+    CURL_LINK  :=
+    BACKEND_MSG := posix-fallback
+endif
+
+# nlohmann/json single-header location (optional — we ship mini_json)
 JSON_HEADER_DIR := include/third_party
 JSON_HEADER     := $(JSON_HEADER_DIR)/json.hpp
 
-# Source files
 SRCDIR   := src
 INCDIR   := include
+BUILDDIR := build/obj
 
 LIB_SRCS := \
     $(SRCDIR)/core/config.cpp \
     $(SRCDIR)/core/http_client.cpp \
     $(SRCDIR)/core/extractor.cpp \
     $(SRCDIR)/core/output.cpp \
-    $(SRCDIR)/core/scraper.cpp
+    $(SRCDIR)/core/scraper.cpp \
+    $(SRCDIR)/core/c_api.cpp
 
-LIB_OBJS := $(patsubst %.cpp,%.o,$(LIB_SRCS))
+LIB_OBJS := $(patsubst $(SRCDIR)/%.cpp,$(BUILDDIR)/%.o,$(LIB_SRCS))
 
 CLI_SRCS := $(SRCDIR)/cli/main.cpp
-CLI_OBJS := $(patsubst %.cpp,%.o,$(CLI_SRCS))
+CLI_OBJS := $(patsubst $(SRCDIR)/%.cpp,$(BUILDDIR)/%.o,$(CLI_SRCS))
 
-TEST_SRCS := \
-    tests/test_main.cpp \
-    tests/test_extractor.cpp
-TEST_OBJS := $(patsubst %.cpp,%.o,$(TEST_SRCS))
+CXXFLAGS := $(CXXSTD) $(WARN) $(OPT) $(PIC) $(VIS) \
+            -I$(INCDIR) $(CURL_CFLAGS) $(CURL_DEFS) \
+            -pthread
 
-# ── Default target ───────────────────────────────────────────────────────────
+LDFLAGS  := -pthread $(CURL_LINK)
+
+# ── Default ──────────────────────────────────────────────────────────────────
 
 .PHONY: all
-all: bullet-scrape
+all: bullet-scrape libbullet_scrape.a
+	@echo ""
+	@echo "Built with backend: $(BACKEND_MSG)"
+	@echo "  ./bullet-scrape --help"
 
-# ── nlohmann/json fetch ──────────────────────────────────────────────────────
+# ── Objects ──────────────────────────────────────────────────────────────────
 
-.PHONY: fetch-json
-fetch-json:
-	@echo "Fetching nlohmann/json single header..."
-	@mkdir -p $(JSON_HEADER_DIR)
-	@curl -fsSL \
-	  "https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp" \
-	  -o $(JSON_HEADER) || \
-	curl -fsSL \
-	  "https://raw.githubusercontent.com/nlohmann/json/develop/single_include/nlohmann/json.hpp" \
-	  -o $(JSON_HEADER) || \
-	(echo "ERROR: could not fetch json.hpp — place it at $(JSON_HEADER) manually" && exit 1)
-	@echo "Done: $(JSON_HEADER)"
-
-# ── Ensure JSON header exists ───────────────────────────────────────────────
-
-NOTICE_JSON := $(shell \
-    if [ ! -f $(JSON_HEADER) ]; then \
-        echo "NOTE: nlohmann/json.hpp not found at $(JSON_HEADER)"; \
-        echo "       Run: make fetch-json  (requires internet)"; \
-        echo "       Or download manually and place at that path."; \
-        echo ""; \
-    fi)
-
-# ── Library objects ──────────────────────────────────────────────────────────
-
-CXXFLAGS := $(CXXSTD) $(WARN) $(OPT) -I$(INCDIR) -I$(INCDIR)/bullet_scrape
-
-$(SRCDIR)/core/%.o: $(SRCDIR)/core/%.cpp $(JSON_HEADER)
+$(BUILDDIR)/%.o: $(SRCDIR)/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(SRCDIR)/cli/%.o: $(SRCDIR)/cli/%.cpp $(JSON_HEADER)
-	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+# ── Static library ───────────────────────────────────────────────────────────
 
-$(TEST_SRCS:.cpp=.o): $(TEST_SRCS) $(JSON_HEADER)
-	@mkdir -p tests
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+libbullet_scrape.a: $(LIB_OBJS)
+	ar rcs $@ $^
+	@echo "Built: $@"
 
-# ── Binary: bullet-scrape ───────────────────────────────────────────────────
+# ── Shared library (C API) ───────────────────────────────────────────────────
+
+.PHONY: shared
+shared: libbullet_scrape.$(SOEXT)
+
+libbullet_scrape.$(SOEXT): $(LIB_OBJS)
+	$(CXX) $(SOFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Built: $@  (backend: $(BACKEND_MSG))"
+
+# Colab / manylinux optimised shared object
+.PHONY: colab
+colab:
+	$(MAKE) clean-objs
+	$(MAKE) shared OPT="-O3 -DNDEBUG -ffast-math -funroll-loops -march=x86-64-v2" \
+	               CXXFLAGS_EXTRA="-D_GLIBCXX_USE_CXX11_ABI=1"
+	@mkdir -p python/bullet_scrape
+	@cp -f libbullet_scrape.$(SOEXT) python/bullet_scrape/
+	@echo "Copied libbullet_scrape.$(SOEXT) → python/bullet_scrape/"
+
+# ── CLI binary ───────────────────────────────────────────────────────────────
 
 bullet-scrape: $(LIB_OBJS) $(CLI_OBJS)
-	@echo "$(NOTICE_JSON)"
 	$(CXX) $(CXXSTD) $(OPT) -o $@ \
 		$(LIB_OBJS) $(CLI_OBJS) \
-		$(CURL_FLAGS) -lpthread
-	@echo "Built: ./bullet-scrape"
+		$(LDFLAGS)
+	@echo "Built: ./bullet-scrape  (backend: $(BACKEND_MSG))"
 
-# ── Test binary ──────────────────────────────────────────────────────────────
+# ── Tests ────────────────────────────────────────────────────────────────────
 
-tests/test_main.o: tests/test_main.cpp $(JSON_HEADER)
-	@mkdir -p tests
+TEST_SRCS := tests/test_main.cpp tests/test_extractor.cpp
+TEST_OBJS := $(patsubst tests/%.cpp,$(BUILDDIR)/tests/%.o,$(TEST_SRCS))
+
+$(BUILDDIR)/tests/%.o: tests/%.cpp
+	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-tests/test_extractor.o: tests/test_extractor.cpp $(JSON_HEADER)
-	@mkdir -p tests
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-bullet_scrape_tests: tests/test_main.o tests/test_extractor.o $(LIB_OBJS)
-	@echo "$(NOTICE_JSON)"
-	$(CXX) $(CXXSTD) $(OPT) -o $@ \
-		tests/test_main.o tests/test_extractor.o $(LIB_OBJS) \
-		$(CURL_FLAGS) -lpthread
+bullet_scrape_tests: $(TEST_OBJS) $(LIB_OBJS)
+	$(CXX) $(CXXSTD) $(OPT) -o $@ $(TEST_OBJS) $(LIB_OBJS) $(LDFLAGS)
 	@echo "Built: ./bullet_scrape_tests"
 
 .PHONY: test
@@ -140,18 +157,29 @@ bench: bullet-scrape
 	./bullet-scrape --bench
 	@echo "=== Done ==="
 
-# ── Example config ───────────────────────────────────────────────────────────
-
 .PHONY: example
 example: bullet-scrape
 	./bullet-scrape --example
 
+# ── Python package install (editable, local) ─────────────────────────────────
+
+.PHONY: python
+python: shared
+	@mkdir -p python/bullet_scrape
+	@cp -f libbullet_scrape.$(SOEXT) python/bullet_scrape/
+	@echo "Shared library staged in python/bullet_scrape/"
+	@echo "Install with:  pip install -e ./python"
+
 # ── Clean ────────────────────────────────────────────────────────────────────
 
-.PHONY: clean
-clean:
-	rm -f $(LIB_OBJS) $(CLI_OBJS) $(TEST_OBJS)
+.PHONY: clean clean-objs
+clean-objs:
+	rm -rf $(BUILDDIR)
+
+clean: clean-objs
 	rm -f bullet-scrape bullet_scrape_tests
+	rm -f libbullet_scrape.a libbullet_scrape.so libbullet_scrape.dylib
+	rm -f python/bullet_scrape/libbullet_scrape.so python/bullet_scrape/libbullet_scrape.dylib
 	rm -rf build/
 
 # ── Install ──────────────────────────────────────────────────────────────────
@@ -159,9 +187,12 @@ clean:
 PREFIX ?= /usr/local
 
 .PHONY: install
-install: bullet-scrape
+install: bullet-scrape libbullet_scrape.a shared
 	install -d $(PREFIX)/bin
 	install -m 755 bullet-scrape $(PREFIX)/bin/bullet-scrape
+	install -d $(PREFIX)/lib
+	install -m 644 libbullet_scrape.a $(PREFIX)/lib/
+	install -m 755 libbullet_scrape.$(SOEXT) $(PREFIX)/lib/
 	install -d $(PREFIX)/include/bullet_scrape
 	cp -r include/bullet_scrape/* $(PREFIX)/include/bullet_scrape/
 	@echo "Installed to $(PREFIX)"
@@ -172,12 +203,15 @@ install: bullet-scrape
 help:
 	@echo "Bullet Scrape — Makefile targets"
 	@echo ""
-	@echo "  make            Build the bullet-scrape binary"
+	@echo "  make            Build CLI + static library"
+	@echo "  make shared     Build libbullet_scrape.$(SOEXT) (C API / Python)"
+	@echo "  make colab      Optimised shared lib + stage into python/"
+	@echo "  make python     Build shared lib and stage for pip install"
 	@echo "  make test       Build and run unit tests"
 	@echo "  make bench      Run micro-benchmark"
 	@echo "  make example    Print example JSON config"
-	@echo "  make fetch-json Download nlohmann/json header (if missing)"
 	@echo "  make clean      Remove all build artifacts"
-	@echo "  make install    Install binary and headers to PREFIX ($(PREFIX))"
+	@echo "  make install    Install to PREFIX ($(PREFIX))"
 	@echo ""
-	@echo "Requirements: g++ >= 8, libcurl, nlohmann/json header"
+	@echo "Detected HTTP backend: $(BACKEND_MSG)"
+	@echo "Requirements: g++ >= 8, pthread; libcurl recommended for HTTPS"

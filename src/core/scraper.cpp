@@ -55,12 +55,13 @@ struct Scraper::Impl {
                   << " URL(s), " << cfg.limits.max_concurrent
                   << " concurrent\n";
 
-        std::mutex           result_mtx;
-        std::condition_variable result_cv;
+        std::mutex                 result_mtx;
         std::vector<ScrapedResult> finished;
+        finished.reserve(urls.size());
         std::atomic<int> done_count{0};
         int total = static_cast<int>(urls.size());
 
+        // fetch_async blocks until every URL completes (bounded worker pool).
         auto on_done = [&](const HttpResponse& resp,
                            const std::string& url,
                            const ScrapeError& err) {
@@ -69,9 +70,9 @@ struct Scraper::Impl {
 
             if (err.code != ErrorCode::Unknown || resp.status == 0) {
                 sr.error       = err.to_string();
-                sr.http_status = resp.status;
+                sr.http_status = static_cast<int>(resp.status);
             } else {
-                sr.http_status     = static_cast<int>(resp.status);
+                sr.http_status      = static_cast<int>(resp.status);
                 sr.bytes_downloaded = resp.bytes;
 
                 auto t_parse = std::chrono::steady_clock::now();
@@ -89,23 +90,17 @@ struct Scraper::Impl {
                 std::lock_guard<std::mutex> lk(result_mtx);
                 finished.push_back(std::move(sr));
             }
-            result_cv.notify_one();
 
-            ++done_count;
+            int n = ++done_count;
             std::cerr << "\r[bullet-scrape] "
-                      << done_count.load() << "/" << total
-                      << " complete   ";
+                      << n << "/" << total
+                      << " complete   " << std::flush;
         };
 
         try {
             client->fetch_async(urls, on_done, cfg);
         } catch (const std::exception& e) {
             std::cerr << "\n[bullet-scrape] fatal: " << e.what() << "\n";
-        }
-
-        {
-            std::unique_lock<std::mutex> lk(result_mtx);
-            result_cv.wait(lk, [&]{ return done_count.load() >= total; });
         }
 
         {
