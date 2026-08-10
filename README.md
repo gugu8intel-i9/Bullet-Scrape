@@ -10,7 +10,7 @@ Bullet Scrape is a high-performance C++ web scraping engine built for speed and 
 | HTTP | libcurl (connection pooling, HTTP/2, gzip, retries) + POSIX fallback |
 | Extraction | Regex (zero-copy) + CSS-selector-lite + XPath (opt-in) |
 | Concurrency | Bounded worker pool, configurable parallelism |
-| Output | JSON · JSONL · CSV · stdout · memory (C/Python API) |
+| Output | JSON · JSONL · CSV · TXT · Parquet (Python) · stdout · memory |
 | Config | Declarative JSON |
 | Bindings | CLI · C API · **Python / Google Colab** |
 | Build | Make / CMake, static + shared library |
@@ -44,7 +44,13 @@ result = bs.scrape({
 })
 print(result.stats)
 print(result.records)
-# df = result.to_dataframe()   # pandas installed by colab_setup
+
+# Export anywhere — format inferred from extension
+result.export("links.parquet")   # optimised zstd parquet (needs pyarrow)
+result.export("links.csv")
+result.export("links.jsonl")
+result.export("links.txt")
+# df = result.to_dataframe()
 ```
 
 📓 Full walkthrough (concurrency, benches, pandas):  
@@ -214,7 +220,25 @@ Supported types: `url_param` · `next_link` · `offset` · `none`.
 }
 ```
 
-Formats: `json` (array) · `jsonl` (lines) · `csv` (needs `csv_fields`) · `stdout` · `memory` (C/Python in-process capture).
+Formats:
+
+| Format | Where | Notes |
+|---|---|---|
+| `json` | CLI / C++ / Python | Pretty JSON array |
+| `jsonl` | CLI / C++ / Python | One object per line (streaming) |
+| `csv` | CLI / C++ / Python | `csv_fields` optional — auto-inferred if omitted |
+| `txt` | CLI / C++ / Python | Human-readable `key: value` blocks |
+| `parquet` | **Python** (`result.export`) | Zstd + dictionary encoding via pyarrow |
+| `stdout` / `memory` | CLI / C API | Print or in-process capture |
+
+```python
+result.export("out.parquet")                         # zstd level 3, dict-encoded
+result.export("out.parquet", compression="snappy")
+result.export("out.csv")
+result.export("out.jsonl")
+result.export("out.txt")
+result.to_parquet("data/results.pq", compression_level=6)
+```
 
 ## Limits & resilience
 

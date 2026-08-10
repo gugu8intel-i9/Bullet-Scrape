@@ -234,10 +234,13 @@ void ScraperConfig::validate() const {
         throw config_error("no queries defined — add at least one query");
 
     if (output.format != "json" && output.format != "jsonl" &&
-        output.format != "csv" && output.format != "stdout" &&
+        output.format != "csv" && output.format != "txt" &&
+        output.format != "text" &&
+        output.format != "stdout" &&
         output.format != "none" && output.format != "null" &&
         output.format != "memory")
-        throw config_error("unsupported output format: " + output.format);
+        throw config_error("unsupported output format: " + output.format
+            + " (want json|jsonl|csv|txt|stdout|memory)");
 }
 
 void ScraperConfig::expand_urls() {

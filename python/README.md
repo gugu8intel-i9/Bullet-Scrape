@@ -53,9 +53,28 @@ print(result.stats)
 for row in result.records[:5]:
     print(row)
 
+# Export — txt / json / jsonl / csv / optimised parquet
+result.export("out.parquet")          # zstd + dictionary encoding
+result.export("out.csv")
+result.export("out.jsonl")
+result.export("out.txt")
+# Shorthands: result.to_csv / to_jsonl / to_txt / to_parquet
+
 # Optional: pandas
 df = result.to_dataframe()
 ```
+
+### Export formats
+
+| Call | Output |
+|---|---|
+| `result.export("f.txt")` | Plain-text `key: value` blocks |
+| `result.export("f.json")` | Pretty JSON array |
+| `result.export("f.jsonl")` | JSON Lines |
+| `result.export("f.csv")` | UTF-8 CSV |
+| `result.export("f.parquet")` | Columnar Parquet (zstd L3, dict encode, 64k row groups) |
+
+Parquet needs `pip install pandas pyarrow` (pulled in by Colab setup / `pip install bullet-scrape[export]`).
 
 ### Offline extract (no network)
 

@@ -83,10 +83,12 @@ struct Limits {
 
 // ── Output target ───────────────────────────────────────────────────────────
 struct OutputConfig {
-    std::string format = "json";   // "json", "jsonl", "csv", "stdout"
+    // format: "json" | "jsonl" | "csv" | "txt" | "stdout" | "memory"
+    // (parquet is exported from the Python bindings — see ScrapeResult.export)
+    std::string format = "json";
     std::string path;               // file path or empty → stdout
     bool array = true;
-    std::vector<std::string> csv_fields; // explicit header order
+    std::vector<std::string> csv_fields; // explicit header / field order (csv, txt)
 };
 
 // ── Full scraper configuration ─────────────────────────────────────────────

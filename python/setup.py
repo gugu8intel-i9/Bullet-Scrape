@@ -85,7 +85,9 @@ setup(
     install_requires=[],
     extras_require={
         "pandas": ["pandas>=1.3"],
-        "colab": ["pandas>=1.3", "matplotlib>=3.5"],
+        "parquet": ["pandas>=1.3", "pyarrow>=10"],
+        "export": ["pandas>=1.3", "pyarrow>=10"],
+        "colab": ["pandas>=1.3", "pyarrow>=10", "matplotlib>=3.5"],
     },
     cmdclass={
         "build_py": build_py,

@@ -36,6 +36,7 @@ from .core import (
     capabilities,
     BulletError,
 )
+from .export import export_records, SUPPORTED_FORMATS
 
 __version__ = "1.0.0"
 __all__ = [
@@ -46,6 +47,8 @@ __all__ = [
     "scrape_file",
     "extract",
     "http_get",
+    "export_records",
+    "SUPPORTED_FORMATS",
     "version",
     "backend_info",
     "capabilities",

@@ -120,8 +120,8 @@ if [[ -z "$WITH_PANDAS" ]]; then
   WITH_PANDAS=$IS_COLAB
 fi
 if [[ "$WITH_PANDAS" == "1" ]]; then
-  echo "→ Installing pandas (optional DataFrame export)…"
-  $PY -m pip install -q "pandas>=1.3" || true
+  echo "→ Installing pandas + pyarrow (DataFrame / optimised Parquet export)…"
+  $PY -m pip install -q "pandas>=1.3" "pyarrow>=10" || true
 fi
 
 # ── 6. Smoke test ────────────────────────────────────────────────────────────

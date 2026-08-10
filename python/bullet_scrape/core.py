@@ -112,7 +112,70 @@ class ScrapeResult:
                 "pandas is required for to_dataframe(). "
                 "Install with: pip install pandas"
             ) from e
-        return pd.DataFrame(self.records)
+        from .export import flatten_records
+        cols, flat = flatten_records(self.records)
+        return pd.DataFrame(flat, columns=cols)
+
+    def export(
+        self,
+        path: Union[str, Path],
+        *,
+        format: Optional[str] = None,
+        columns: Optional[List[str]] = None,
+        compression: str = "zstd",
+        compression_level: Optional[int] = 3,
+        row_group_size: int = 64_000,
+        use_dictionary: bool = True,
+        delimiter: str = ",",
+        indent: int = 2,
+    ) -> Dict[str, Any]:
+        """
+        Export scraped records to disk.
+
+        Formats (auto-detected from extension, or pass format=):
+          • txt      — human-readable key: value blocks
+          • json     — pretty JSON array
+          • jsonl    — one JSON object per line
+          • csv      — UTF-8 CSV
+          • parquet  — columnar, zstd-compressed (needs pandas + pyarrow)
+
+        Examples
+        --------
+        >>> result.export("out.parquet")
+        >>> result.export("out.csv")
+        >>> result.export("out.txt")
+        >>> result.export("data.jsonl")
+        >>> result.export("out.pq", compression="snappy")
+        """
+        from .export import export_records
+        return export_records(
+            self.records,
+            path,
+            format=format,
+            columns=columns,
+            compression=compression,
+            compression_level=compression_level,
+            row_group_size=row_group_size,
+            use_dictionary=use_dictionary,
+            delimiter=delimiter,
+            indent=indent,
+        )
+
+    def to_jsonl(self, path: Union[str, Path]) -> Dict[str, Any]:
+        """Shorthand: export as JSON Lines."""
+        return self.export(path, format="jsonl")
+
+    def to_csv(self, path: Union[str, Path], **kwargs) -> Dict[str, Any]:
+        """Shorthand: export as CSV."""
+        return self.export(path, format="csv", **kwargs)
+
+    def to_txt(self, path: Union[str, Path], **kwargs) -> Dict[str, Any]:
+        """Shorthand: export as plain text."""
+        return self.export(path, format="txt", **kwargs)
+
+    def to_parquet(self, path: Union[str, Path], **kwargs) -> Dict[str, Any]:
+        """Shorthand: export as optimised Parquet (zstd by default)."""
+        return self.export(path, format="parquet", **kwargs)
 
     def __len__(self) -> int:
         return len(self.records)
