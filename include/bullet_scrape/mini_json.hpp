@@ -13,6 +13,9 @@
 #include <sstream>
 #include <iomanip>
 #include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <cmath>
 #include <fstream>
@@ -193,16 +196,11 @@ public:
     }
 
     // ── Iteration ────────────────────────────────────────────────────────────
-    object_t::const_iterator begin() const {
-        static object_t empty;
-        if (!is_object()) return empty.end();
-        return std::get<std::shared_ptr<object_t>>(data_)->begin();
-    }
-    object_t::const_iterator end() const {
-        static object_t empty;
-        if (!is_object()) return empty.end();
-        return std::get<std::shared_ptr<object_t>>(data_)->end();
-    }
+    // NOTE: defined out-of-line (below). A function-local `static object_t`
+    // inside the class instantiates unordered_map<std::string, json> while
+    // the class is still being completed — rejected by libstdc++ (GCC ≤ 11).
+    object_t::const_iterator begin() const;
+    object_t::const_iterator end() const;
 
     // ── Serialization ────────────────────────────────────────────────────────
     std::string dump(int indent = -1) const {
@@ -212,38 +210,61 @@ public:
     }
 
 private:
+    // Write a JSON string literal (keys and values alike) with all required
+    // escapes — keys were previously emitted raw and could break the output.
+    static void write_escaped(std::ostringstream& ss, const std::string& s) {
+        static const char* hex_digits = "0123456789abcdef";
+        ss << '"';
+        for (char c : s) {
+            switch (c) {
+                case '"':  ss << "\\\""; break;
+                case '\\': ss << "\\\\"; break;
+                case '\n': ss << "\\n";  break;
+                case '\r': ss << "\\r";  break;
+                case '\t': ss << "\\t";  break;
+                case '\b': ss << "\\b";  break;
+                case '\f': ss << "\\f";  break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        ss << "\\u00"
+                           << hex_digits[(static_cast<unsigned char>(c) >> 4) & 0xF]
+                           << hex_digits[static_cast<unsigned char>(c) & 0xF];
+                    } else {
+                        ss << c;
+                    }
+            }
+        }
+        ss << '"';
+    }
+
     void dump_to(std::ostringstream& ss, int indent, int level) const {
         if (is_null())   { ss << "null"; return; }
         if (is_bool())   { ss << (get_bool() ? "true" : "false"); return; }
         if (is_int())    { ss << get_int(); return; }
         if (is_float()) {
+            // Format into a local stream: iomanip state (std::fixed etc.) is
+            // sticky, and leaking it into the shared stream used to corrupt
+            // later floats (1e16 dumped with fixed precision-15 = pages of 0s).
+            // Non-finite doubles aren't valid JSON — emit null. The check is
+            // done on the bit pattern because -ffast-math compiles
+            // std::isfinite away (the library builds with -ffast-math).
             double v = get_float();
-            if (std::floor(v) == v && std::abs(v) < 1e15)
-                ss << std::fixed << std::setprecision(1) << v;
+            uint64_t bits = 0;
+            static_assert(sizeof bits == sizeof v, "double must be 64-bit");
+            std::memcpy(&bits, &v, sizeof bits);
+            if ((bits & 0x7FF0000000000000ull) == 0x7FF0000000000000ull) {
+                ss << "null"; return;                       // inf / nan
+            }
+            std::ostringstream fs;
+            if (v == std::trunc(v) && std::abs(v) < 1e15)
+                fs << std::fixed << std::setprecision(1) << v;
             else
-                ss << std::setprecision(15) << v;
+                fs << std::setprecision(15) << v;
+            ss << fs.str();
             return;
         }
         if (is_string()) {
-            ss << '"';
-            for (char c : get_string()) {
-                switch (c) {
-                    case '"':  ss << "\\\""; break;
-                    case '\\': ss << "\\\\"; break;
-                    case '\n': ss << "\\n";  break;
-                    case '\r': ss << "\\r";  break;
-                    case '\t': ss << "\\t";  break;
-                    default:
-                        if (static_cast<unsigned char>(c) < 0x20)
-                            ss << "\\u"
-                               << std::hex << std::setw(4) << std::setfill('0')
-                               << static_cast<int>(static_cast<unsigned char>(c))
-                               << std::dec << std::setfill(' ');
-                        else
-                            ss << c;
-                }
-            }
-            ss << '"';
+            write_escaped(ss, get_string());
             return;
         }
         if (is_array()) {
@@ -279,7 +300,8 @@ private:
                 for (auto& [k, v] : obj) {
                     if (!first) ss << ",";
                     first = false;
-                    ss << '"' << k << '"' << ":";
+                    write_escaped(ss, k);
+                    ss << ":";
                     v.dump_to(ss, -1, 0);
                 }
                 ss << "}";
@@ -291,7 +313,9 @@ private:
                 for (auto& [k, v] : obj) {
                     if (!first) ss << ",\n";
                     first = false;
-                    ss << pad << '"' << k << '"' << ": ";
+                    ss << pad;
+                    write_escaped(ss, k);
+                    ss << ": ";
                     v.dump_to(ss, indent, level + 1);
                 }
                 ss << "\n" << pad0 << "}";
@@ -305,7 +329,12 @@ private:
 public:
     static json parse(const std::string& s) {
         json_parser p{s};
-        return p.parse_value();
+        json v = p.parse_value();
+        p.skip_ws();
+        if (p.pos != s.size())
+            throw std::runtime_error("json: trailing data at pos " +
+                                     std::to_string(p.pos));
+        return v;
     }
 
     static json parse_file(const std::string& path) {
@@ -369,9 +398,39 @@ private:
             throw std::runtime_error("json: invalid token at pos " + std::to_string(pos));
         }
 
+        // Read exactly 4 hex digits at pos (used by \u escapes).
+        unsigned int parse_hex4() {
+            if (pos + 4 > s.size())
+                throw std::runtime_error("json: incomplete \\u escape");
+            unsigned int cp = 0;
+            for (int k = 0; k < 4; ++k) {
+                char c = s[pos++];
+                cp <<= 4;
+                if (c >= '0' && c <= '9') cp |= static_cast<unsigned int>(c - '0');
+                else if (c >= 'a' && c <= 'f') cp |= static_cast<unsigned int>(c - 'a' + 10);
+                else if (c >= 'A' && c <= 'F') cp |= static_cast<unsigned int>(c - 'A' + 10);
+                else throw std::runtime_error("json: bad hex digit in \\u escape");
+            }
+            return cp;
+        }
+
         json parse_string() {
             expect('"');
-            std::string out;
+            // Fast path: bulk-copy until the closing quote when there are no
+            // escape sequences (the overwhelmingly common case).
+            const size_t start = pos;
+            while (pos < s.size()) {
+                char c = s[pos];
+                if (c == '"') {
+                    std::string out = s.substr(start, pos - start);
+                    ++pos;
+                    return json(std::move(out));
+                }
+                if (c == '\\') break;
+                ++pos;
+            }
+            // Slow path: escape handling.
+            std::string out = s.substr(start, pos - start);
             while (pos < s.size()) {
                 char c = s[pos++];
                 if (c == '"') return json(std::move(out));
@@ -389,18 +448,35 @@ private:
                         case 'b':  out += '\b'; break;
                         case 'f':  out += '\f'; break;
                         case 'u': {
-                            if (pos + 4 > s.size())
-                                throw std::runtime_error("json: incomplete \\u escape");
-                            unsigned int cp = static_cast<unsigned int>(
-                                std::stoul(s.substr(pos, 4), nullptr, 16));
-                            pos += 4;
+                            // Parse a UTF-16 code unit (\uXXXX), decoding
+                            // surrogate pairs into a single code point.
+                            unsigned int cp = parse_hex4();
+                            if (cp >= 0xD800 && cp <= 0xDBFF &&
+                                pos + 6 <= s.size() && s[pos] == '\\' &&
+                                s[pos + 1] == 'u') {
+                                // possible low surrogate follows
+                                json_parser save = *this;
+                                pos += 2;
+                                unsigned int lo = parse_hex4();
+                                if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                } else {
+                                    pos = save.pos; // not a pair — keep the lone unit
+                                }
+                            }
+                            if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD; // lone surrogate
                             if (cp < 0x80) {
                                 out += static_cast<char>(cp);
                             } else if (cp < 0x800) {
                                 out += static_cast<char>(0xC0 | (cp >> 6));
                                 out += static_cast<char>(0x80 | (cp & 0x3F));
-                            } else {
+                            } else if (cp < 0x10000) {
                                 out += static_cast<char>(0xE0 | (cp >> 12));
+                                out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                                out += static_cast<char>(0x80 | (cp & 0x3F));
+                            } else {
+                                out += static_cast<char>(0xF0 | (cp >> 18));
+                                out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
                                 out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
                                 out += static_cast<char>(0x80 | (cp & 0x3F));
                             }
@@ -479,6 +555,23 @@ private:
         }
     };
 };
+
+// ── Out-of-line iteration definitions (see note in-class) ───────────────────
+namespace detail {
+inline const json::object_t& empty_object_map() {
+    static const json::object_t empty;
+    return empty;
+}
+} // namespace detail
+
+inline json::object_t::const_iterator json::begin() const {
+    if (!is_object()) return detail::empty_object_map().end();
+    return std::get<std::shared_ptr<object_t>>(data_)->begin();
+}
+inline json::object_t::const_iterator json::end() const {
+    if (!is_object()) return detail::empty_object_map().end();
+    return std::get<std::shared_ptr<object_t>>(data_)->end();
+}
 
 // ── Convenience functions ────────────────────────────────────────────────────
 inline json json_parse(const std::string& s)     { return json::parse(s); }

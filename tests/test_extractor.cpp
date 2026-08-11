@@ -3,6 +3,8 @@
 #include "bullet_scrape/mini_json.hpp"
 #include "bullet_scrape/exceptions.hpp"
 #include "test_harness.hpp"
+#include <cmath>
+#include <limits>
 #include <string>
 #include <iostream>
 
@@ -219,6 +221,287 @@ REGISTER_TEST(extractor_class_selector) {
     return true;
 }
 
+// ── Regression tests for parsing bugs ───────────────────────────────────────
+
+REGISTER_TEST(selector_id_with_common_letters) {
+    // The id charset in the old parser contained the literal letters
+    // s,p,a,c,e ("[:space" typo) — ids like "header" were truncated to "h".
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "div#header",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    auto r = ExtractionEngine().execute(cfg, R"XXX(<div id="header">Hello</div>)XXX");
+    if (r.size() != 1) { std::cerr << "id selector matched " << r.size() << "\n"; return false; }
+    return r[0]["t"][0].get_string() == "Hello";
+}
+
+REGISTER_TEST(selector_multi_class) {
+    // `div.a.b` was parsed as tag "divb" + class "a" by the old erasing parser.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "div.a.b",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    std::string html = R"XXX(<div class="a b c">Yes</div><div class="a">No</div><div class="b">No</div><span class="a b">No</span>)XXX";
+    auto r = ExtractionEngine().execute(cfg, html);
+    if (r.size() != 1) { std::cerr << "multi-class matched " << r.size() << "\n"; return false; }
+    return r[0]["t"][0].get_string() == "Yes";
+}
+
+REGISTER_TEST(selector_single_quoted_attrs) {
+    // id='...' / class='...' never matched (the re-search result was discarded).
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "a": { "selector": "div#main",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    auto r = ExtractionEngine().execute(cfg, "<div id='main'>Hi</div>");
+    if (r.size() != 1) return false;
+
+    cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "a": { "selector": "div.card",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    r = ExtractionEngine().execute(cfg, "<div class='card'>Hi</div>");
+    return r.size() == 1;
+}
+
+REGISTER_TEST(selector_attr_presence_and_value) {
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "a": { "selector": "a[href]",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    auto r = ExtractionEngine().execute(cfg, R"XXX(<a href="/x">With</a><a>Without</a>)XXX");
+    if (r.size() != 1) return false;
+
+    cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "a": { "selector": "div[data-id=\"101\"]",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    r = ExtractionEngine().execute(cfg, R"XXX(<div data-id="100">A</div><div data-id="101">B</div>)XXX");
+    return r.size() == 1 && r[0]["t"][0].get_string() == "B";
+}
+
+REGISTER_TEST(selector_compound_uses_rightmost) {
+    // Compound selectors use the rightmost simple segment ("div.card > a" → "a").
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "a": { "selector": "div.card > a.link",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    auto r = ExtractionEngine().execute(cfg, R"XXX(<div class="card"><a class="link">In</a></div><a>Out</a>)XXX");
+    if (r.size() != 1) { std::cerr << "compound matched " << r.size() << "\n"; return false; }
+    return r[0]["t"][0].get_string() == "In";
+}
+
+REGISTER_TEST(void_and_self_closing_tags) {
+    // <img> has no close tag; it used to swallow the rest of the page and
+    // reverse the record order.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "img",
+        "extract": [ { "name": "s", "rule": { "attribute": "src" } } ] } }
+    })CFG");
+    auto r = ExtractionEngine().execute(cfg, R"XXX(<img src="a.png"><img src="b.png">)XXX");
+    if (r.size() != 2) { std::cerr << "expected 2 imgs, got " << r.size() << "\n"; return false; }
+    if (r[0]["s"][0].get_string() != "a.png") return false;
+    if (r[1]["s"][0].get_string() != "b.png") return false;
+
+    // Explicit self-close: content after <div/> is not inside the div.
+    cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "div.self",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    r = ExtractionEngine().execute(cfg, R"XXX(<div class="self"/>after)XXX");
+    return r.size() == 1 && r[0]["t"][0].get_string().empty();
+}
+
+REGISTER_TEST(quoted_gt_in_attribute) {
+    // A '>' inside a quoted attribute must not terminate the tag scan.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "div.note",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    std::string html = R"XXX(<div class="note" title="a > b">Keep</div><div class="note">Two</div>)XXX";
+    auto r = ExtractionEngine().execute(cfg, html);
+    if (r.size() != 2) { std::cerr << "expected 2, got " << r.size() << "\n"; return false; }
+    if (r[0]["t"][0].get_string() != "Keep") return false;
+    if (r[1]["t"][0].get_string() != "Two") return false;
+    return true;
+}
+
+REGISTER_TEST(script_style_content_skipped) {
+    // Script/style content is raw text, not markup: tags inside JS strings
+    // must not be indexed, and JS must not leak into extracted text.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "div",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    std::string html = R"XXX(<div>Before</div><script>var s = "<div>Fake</div>";</script><div>After</div>)XXX";
+    auto r = ExtractionEngine().execute(cfg, html);
+    if (r.size() != 2) { std::cerr << "expected 2 real divs, got " << r.size() << "\n"; return false; }
+    if (r[0]["t"][0].get_string() != "Before") return false;
+    if (r[1]["t"][0].get_string() != "After") return false;
+    return true;
+}
+
+REGISTER_TEST(unclosed_elements_recover) {
+    // Missing close tags: elements must not swallow the rest of the page.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "span.i",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    std::string html = R"XXX(<div><span class="i">One</div><div><span class="i">Two</span></div>)XXX";
+    auto r = ExtractionEngine().execute(cfg, html);
+    if (r.size() != 2) { std::cerr << "expected 2, got " << r.size() << "\n"; return false; }
+    if (r[0]["t"][0].get_string() != "One") return false;
+    if (r[1]["t"][0].get_string() != "Two") return false;
+    return true;
+}
+
+REGISTER_TEST(text_decodes_entities) {
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "p",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    auto r = ExtractionEngine().execute(cfg, R"XXX(<p>Coffee &amp; Tea &#8212; &lt;hot&gt;</p>)XXX");
+    if (r.size() != 1) return false;
+    std::string t = r[0]["t"][0].get_string();
+    if (t != "Coffee & Tea \xE2\x80\x94 <hot>") { std::cerr << "got: " << t << "\n"; return false; }
+    // &amp; in attribute values decodes as well
+    cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "a",
+        "extract": [ { "name": "u", "rule": { "attribute": "href" } } ] } }
+    })CFG");
+    r = ExtractionEngine().execute(cfg, R"XXX(<a href="/x?a=1&amp;b=2">l</a>)XXX");
+    return r.size() == 1 && r[0]["u"][0].get_string() == "/x?a=1&b=2";
+}
+
+REGISTER_TEST(text_skips_comments) {
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "div",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    auto r = ExtractionEngine().execute(cfg, R"XXX(<div>real <!-- a > b comment --> text</div>)XXX");
+    if (r.size() != 1) return false;
+    return r[0]["t"][0].get_string() == "real text";
+}
+
+REGISTER_TEST(literal_null_string_survives) {
+    // The old transform pipeline used the string "null" as a null sentinel,
+    // turning real text into JSON null.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "td",
+        "extract": [ { "name": "v", "rule": { "text": true, "transform": ["trim"] } } ] } }
+    })CFG");
+    auto r = ExtractionEngine().execute(cfg, "<td>null</td>");
+    if (r.size() != 1) return false;
+    auto& v = r[0]["v"];
+    return v.is_array() && v.size() == 1 && v[0].is_string() && v[0].get_string() == "null";
+}
+
+REGISTER_TEST(regex_group_counting) {
+    // Non-capturing groups and parens inside character classes must not be
+    // counted as capture groups.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "regex": "[(]price[)]: ([0-9]+)",
+        "extract": [ { "name": "p", "rule": { "aggregate": "first", "transform": ["int"] } } ] } }
+    })CFG");
+    auto r = ExtractionEngine().execute(cfg, "(price): 42");
+    if (r.size() != 1) return false;
+    if (!r[0]["p"].is_int() || r[0]["p"].get_int() != 42) return false;
+
+    cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "regex": "(?:item)-([a-z]+)",
+        "extract": [ { "name": "p", "rule": { "aggregate": "first" } } ] } }
+    })CFG");
+    r = ExtractionEngine().execute(cfg, "item-abc");
+    return r.size() == 1 && r[0]["p"].get_string() == "abc";
+}
+
+REGISTER_TEST(invalid_regex_is_a_config_error) {
+    // An uncompilable pattern must surface an error, not silently match nothing.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "regex": "([unclosed",
+        "extract": [ { "name": "p", "rule": {} } ] } }
+    })CFG");
+    try {
+        ExtractionEngine().execute(cfg, "text");
+    } catch (const ScrapeError& e) {
+        return e.code == ErrorCode::Config;
+    }
+    return false;
+}
+
+REGISTER_TEST(nested_same_tag_and_document_order) {
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "div.i",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    std::string html = R"XXX(<div class="i">first</div><div class="i">second</div><div class="i">third</div>)XXX";
+    auto r = ExtractionEngine().execute(cfg, html);
+    if (r.size() != 3) return false;
+    if (r[0]["t"][0].get_string() != "first")  return false;
+    if (r[1]["t"][0].get_string() != "second") return false;
+    if (r[2]["t"][0].get_string() != "third")  return false;
+    return true;
+}
+
+REGISTER_TEST(json_object_keys_escaped) {
+    // Keys with quotes/control chars used to break the emitted JSON.
+    json j = json::object();
+    j["a\"b\tc"] = 1;
+    std::string s = j.dump();
+    // round-trip
+    auto back = json::parse(s);
+    if (!back.contains("a\"b\tc") || back["a\"b\tc"].get_int() != 1) return false;
+    return true;
+}
+
+REGISTER_TEST(json_rejects_trailing_garbage) {
+    bool threw = false;
+    try { json::parse("[1, 2] oops"); } catch (const std::exception&) { threw = true; }
+    if (!threw) return false;
+    // trailing whitespace is fine
+    try { json::parse("[1, 2] \n\t "); } catch (...) { return false; }
+    return true;
+}
+
+REGISTER_TEST(config_pagination_order_preserved) {
+    // all_urls used to be sorted lexicographically: page 10 landed before 2.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com/i",
+      "pagination": { "type": "url_param", "param": "p", "start_page": 1, "max_pages": 11 },
+      "queries": { "q": { "selector": "li",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    if (cfg.all_urls.size() != 11) return false;
+    for (int k = 0; k < 11; ++k) {
+        std::string want = "https://example.com/i?p=" + std::to_string(k + 1);
+        if (cfg.all_urls[size_t(k)] != want) {
+            std::cerr << "url " << k << ": " << cfg.all_urls[size_t(k)] << " != " << want << "\n";
+            return false;
+        }
+    }
+    return true;
+}
+
 REGISTER_TEST(config_loading) {
     ScraperConfig cfg;
     cfg.load(json::parse(R"XXX({"name":"test","url":"https://example.com/items","pagination":{"type":"url_param","param":"page","start_page":1,"max_pages":5},"queries":{"items":{"selector":"li","extract":[{"name":"text","rule":{"text":true}}]}},"output":{"format":"json"},"limits":{"max_concurrent":4}})XXX"),"<test>");
@@ -238,5 +521,137 @@ REGISTER_TEST(config_validation_errors) {
         if (e.code == ErrorCode::Config) caught = true;
     }
     return caught;
+}
+
+// ── Regression: selector/attr/urljoin edge cases & bulk mode ────────────────
+
+REGISTER_TEST(selector_attr_value_with_space) {
+    // The old parser split the selector on ANY whitespace, so a space inside
+    // a quoted attr value (`a[href="foo bar"]`) truncated the selector.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "div.wrap > a[href=\"foo bar\"]",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    auto r = ExtractionEngine().execute(cfg,
+        R"XXX(<div class="wrap"><a href="foo bar">Hit</a><a href="foo">Miss</a></div>)XXX");
+    if (r.size() != 1) { std::cerr << "matched " << r.size() << "\n"; return false; }
+    return r[0]["t"][0].get_string() == "Hit";
+}
+
+REGISTER_TEST(selector_tagless_id_matches_any_tag) {
+    // `#logo` used to consult a fixed list of ~14 common tags only, so an id
+    // on an <img> (or any unlisted tag) never matched.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "#logo",
+        "extract": [ { "name": "s", "rule": { "attribute": "src" } } ] } }
+    })CFG");
+    auto r = ExtractionEngine().execute(cfg,
+        R"XXX(<custom-el id="other">x</custom-el><img id="logo" src="logo.png">)XXX");
+    if (r.size() != 1) { std::cerr << "matched " << r.size() << "\n"; return false; }
+    return r[0]["s"][0].get_string() == "logo.png";
+}
+
+REGISTER_TEST(urljoin_query_and_fragment) {
+    // urljoin used to mangle "?page=2" / "#frag" links (dropping the base
+    // path or doubling the query). RFC 3986: query/fragment-only references
+    // keep the base document path; the base's own query/fragment drops.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://shop.example.com/cat/1?sort=asc#top",
+      "queries": { "q": { "selector": "a",
+        "extract": [ { "name": "u", "rule": { "attribute": "href", "transform": ["urljoin"] } } ] } }
+    })CFG");
+    auto r = ExtractionEngine().execute(cfg,
+        R"XXX(<a href="?page=2">2</a><a href="#sec">s</a><a href="next">n</a>)XXX",
+        "https://shop.example.com/cat/1?sort=asc#top");
+    if (r.size() != 3) { std::cerr << "matched " << r.size() << "\n"; return false; }
+    const std::string q = r[0]["u"][0].get_string();
+    const std::string f = r[1]["u"][0].get_string();
+    const std::string d = r[2]["u"][0].get_string();
+    if (q != "https://shop.example.com/cat/1?page=2") { std::cerr << q << "\n"; return false; }
+    if (f != "https://shop.example.com/cat/1#sec")    { std::cerr << f << "\n"; return false; }
+    if (d != "https://shop.example.com/cat/next")     { std::cerr << d << "\n"; return false; }
+
+    // Non-hierarchical schemes pass through untouched.
+    r = ExtractionEngine().execute(cfg, R"XXX(<a href="mailto:a@b.c">m</a>)XXX",
+        "https://shop.example.com/cat/1");
+    return r.size() == 1 && r[0]["u"][0].get_string() == "mailto:a@b.c";
+}
+
+REGISTER_TEST(bulk_text_mode) {
+    // is_html=false: the matched bytes are the value — no tag stripping, and
+    // selector queries are skipped. The cleaning sieve still runs (default:
+    // entities + invisibles + whitespace), which suits log/CSV scraping.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "regex": "ERROR: (.*)",
+        "extract": [ { "name": "m", "rule": {} } ] } }
+    })CFG");
+    // BEL (\x07) and a trailing NBSP inside the captured text; '.'
+    // does not cross the '\n'.
+    const std::string log = "ERROR: disk \x07" "full\xC2\xA0\nINFO ok\n";
+    auto r = ExtractionEngine().execute(cfg, log, "", /*is_html=*/false);
+    if (r.size() != 1) { std::cerr << "records " << r.size() << "\n"; return false; }
+    auto& m = r[0]["m"];
+    if (!m.is_array() || m.size() != 1) { std::cerr << m.dump() << "\n"; return false; }
+    const std::string got = m[0].get_string();
+    if (got != "disk full") { std::cerr << "got: [" << got << "]\n"; return false; }
+
+    // Same run in HTML mode over this markup-free text: identical result.
+    r = ExtractionEngine().execute(cfg, log, "", /*is_html=*/true);
+    return r.size() == 1 && r[0]["m"][0].get_string() == "disk full";
+}
+
+REGISTER_TEST(config_query_needs_match_type) {
+    // A query without selector/regex/xpath can never match — validate() must
+    // reject it instead of silently scraping nothing.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "typo": { "seletor": "div", "extract": [] } }
+    })CFG");
+    bool caught = false;
+    try { cfg.validate(); }
+    catch (const ScrapeError& e) { caught = (e.code == ErrorCode::Config); }
+    return caught;
+}
+
+REGISTER_TEST(json_float_formatting_and_specials) {
+    // Regression: float dumping leaked a sticky std::fixed across the whole
+    // object (later ints/strings printed as "1.000000"), and non-finite
+    // doubles emitted invalid JSON ("inf").
+    json j = json::object();
+    j["f"] = 1.5;
+    j["i"] = 42;                                 // must print "42", not "42.000000"
+    j["s"] = "x";
+    j["nan"] = std::numeric_limits<double>::quiet_NaN();
+    j["inf"] = std::numeric_limits<double>::infinity();
+    const std::string s = j.dump();
+    auto back = json::parse(s);                  // must remain parseable
+    if (!back.contains("i") || back["i"].get_int() != 42) {
+        std::cerr << "int mangled: " << s << "\n"; return false;
+    }
+    if (std::fabs(back["f"].get_float() - 1.5) > 1e-12) return false;
+    if (!back["nan"].is_null() || !back["inf"].is_null()) {
+        std::cerr << "non-finite not null: " << s << "\n"; return false;
+    }
+    if (back["s"].get_string() != "x") return false;
+    return true;
+}
+
+REGISTER_TEST(json_unicode_surrogate_roundtrip) {
+    // "\uD83D\uDE00" must join into one 4-byte UTF-8 char (😀), not two
+    // 3-byte surrogate encodings; a lone surrogate becomes U+FFFD.
+    auto j = json::parse(R"XXX(" grin: \uD83D\uDE00, lone: \uD83D ")XXX");
+    const std::string v = j.get_string();
+    if (v.find("\xF0\x9F\x98\x80") == std::string::npos) {
+        std::cerr << "no joined surrogate pair\n"; return false;
+    }
+    if (v.find("\xEF\xBF\xBD") == std::string::npos) {
+        std::cerr << "lone surrogate not replaced\n"; return false;
+    }
+    // round-trip through dump(): the emoji must survive as a \uXXXX pair.
+    auto j2 = json::parse(j.dump());
+    return j2.get_string() == v;
 }
 
