@@ -1,5 +1,6 @@
 #pragma once
 #include "bullet_scrape/mini_json.hpp"
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -30,6 +31,8 @@ struct ExtractRule {
     std::optional<AggregateOp> aggregate;   // "join", "count", "unique", ...
     std::optional<std::string> join_sep;    // separator for "join"
     bool  optional = false;                 // don't error if missing
+    int   clean = -1;                       // cleaning-stage bitmask; -1 → inherit
+                                          // ScraperConfig::clean, 0 → off
 
     void load(const json& j);
 };
@@ -105,6 +108,12 @@ struct ScraperConfig {
     OutputConfig output;
     std::unordered_map<std::string, CollectionQuery> queries; // name → query
     std::optional<Pagination> pagination;
+
+    // The cleaning "sieve": bitmask of CleanStage (see cleaner.hpp) applied
+    // to every extracted value before transforms. Defaults to CLEAN_DEFAULT —
+    // entities + invisibles + whitespace. "clean": false disables; a rule may
+    // override with its own "clean".
+    uint32_t clean;   // initialised in the .cpp (CLEAN_DEFAULT)
 
     // Derived: the full list of URLs to scrape
     std::vector<std::string> all_urls;

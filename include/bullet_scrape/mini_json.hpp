@@ -13,6 +13,9 @@
 #include <sstream>
 #include <iomanip>
 #include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <cmath>
 #include <fstream>
@@ -239,11 +242,25 @@ private:
         if (is_bool())   { ss << (get_bool() ? "true" : "false"); return; }
         if (is_int())    { ss << get_int(); return; }
         if (is_float()) {
+            // Format into a local stream: iomanip state (std::fixed etc.) is
+            // sticky, and leaking it into the shared stream used to corrupt
+            // later floats (1e16 dumped with fixed precision-15 = pages of 0s).
+            // Non-finite doubles aren't valid JSON — emit null. The check is
+            // done on the bit pattern because -ffast-math compiles
+            // std::isfinite away (the library builds with -ffast-math).
             double v = get_float();
-            if (std::floor(v) == v && std::abs(v) < 1e15)
-                ss << std::fixed << std::setprecision(1) << v;
+            uint64_t bits = 0;
+            static_assert(sizeof bits == sizeof v, "double must be 64-bit");
+            std::memcpy(&bits, &v, sizeof bits);
+            if ((bits & 0x7FF0000000000000ull) == 0x7FF0000000000000ull) {
+                ss << "null"; return;                       // inf / nan
+            }
+            std::ostringstream fs;
+            if (v == std::trunc(v) && std::abs(v) < 1e15)
+                fs << std::fixed << std::setprecision(1) << v;
             else
-                ss << std::setprecision(15) << v;
+                fs << std::setprecision(15) << v;
+            ss << fs.str();
             return;
         }
         if (is_string()) {
@@ -381,6 +398,22 @@ private:
             throw std::runtime_error("json: invalid token at pos " + std::to_string(pos));
         }
 
+        // Read exactly 4 hex digits at pos (used by \u escapes).
+        unsigned int parse_hex4() {
+            if (pos + 4 > s.size())
+                throw std::runtime_error("json: incomplete \\u escape");
+            unsigned int cp = 0;
+            for (int k = 0; k < 4; ++k) {
+                char c = s[pos++];
+                cp <<= 4;
+                if (c >= '0' && c <= '9') cp |= static_cast<unsigned int>(c - '0');
+                else if (c >= 'a' && c <= 'f') cp |= static_cast<unsigned int>(c - 'a' + 10);
+                else if (c >= 'A' && c <= 'F') cp |= static_cast<unsigned int>(c - 'A' + 10);
+                else throw std::runtime_error("json: bad hex digit in \\u escape");
+            }
+            return cp;
+        }
+
         json parse_string() {
             expect('"');
             // Fast path: bulk-copy until the closing quote when there are no
@@ -415,18 +448,35 @@ private:
                         case 'b':  out += '\b'; break;
                         case 'f':  out += '\f'; break;
                         case 'u': {
-                            if (pos + 4 > s.size())
-                                throw std::runtime_error("json: incomplete \\u escape");
-                            unsigned int cp = static_cast<unsigned int>(
-                                std::stoul(s.substr(pos, 4), nullptr, 16));
-                            pos += 4;
+                            // Parse a UTF-16 code unit (\uXXXX), decoding
+                            // surrogate pairs into a single code point.
+                            unsigned int cp = parse_hex4();
+                            if (cp >= 0xD800 && cp <= 0xDBFF &&
+                                pos + 6 <= s.size() && s[pos] == '\\' &&
+                                s[pos + 1] == 'u') {
+                                // possible low surrogate follows
+                                json_parser save = *this;
+                                pos += 2;
+                                unsigned int lo = parse_hex4();
+                                if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                } else {
+                                    pos = save.pos; // not a pair — keep the lone unit
+                                }
+                            }
+                            if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD; // lone surrogate
                             if (cp < 0x80) {
                                 out += static_cast<char>(cp);
                             } else if (cp < 0x800) {
                                 out += static_cast<char>(0xC0 | (cp >> 6));
                                 out += static_cast<char>(0x80 | (cp & 0x3F));
-                            } else {
+                            } else if (cp < 0x10000) {
                                 out += static_cast<char>(0xE0 | (cp >> 12));
+                                out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                                out += static_cast<char>(0x80 | (cp & 0x3F));
+                            } else {
+                                out += static_cast<char>(0xF0 | (cp >> 18));
+                                out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
                                 out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
                                 out += static_cast<char>(0x80 | (cp & 0x3F));
                             }

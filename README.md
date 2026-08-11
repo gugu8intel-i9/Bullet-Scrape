@@ -208,6 +208,50 @@ When `xpath` is set, Bullet Scrape parses with pugixml and runs an XPath query. 
 
 `trim` · `lowercase` · `uppercase` · `int` · `float` · `urljoin` · `regex_sub`
 
+`int`/`float` tolerate scraped formatting — `"$1,299.50"`, `"-€2,000"`,
+`"1.5e3"` convert to `1299.5`, `-2000`, `1500` without any extra cleaning
+config. Values that carry no parseable number (e.g. `"Free!"`) stay strings,
+or become `null` when the final transform is numeric.
+
+### Data cleaning sieve
+
+Every extracted value runs through a configurable chain of cleaning stages —
+think of it as a sieve that scraped bytes pass through before transforms:
+
+| Stage | What it removes / rewrites |
+|---|---|
+| `entities` | HTML entities → text: `&amp;`, `&eacute;`, `&#x1F600;`, `&#8230;` (~250 names — Latin-1, Greek, math, punctuation, symbols — plus decimal/hex numerics with the Windows-1252 correction for `&#150;` et al.) |
+| `invisibles` | Zero-width & control chars: `U+200B–U+200F`, `U+202A–U+202E`, `U+2060+`, `U+FEFF`, soft hyphens, C0/C1 control bytes (except `\t \n \r`) |
+| `whitespace` | Unicode whitespace (NBSP, thin/em spaces, …) → plain space; collapses runs; trims ends |
+| `fold` | Smart quotes and dashes → ASCII: `“ ” ‘ ’` → `" '`, `– —` → `-`, `…` → `...`, `‹ › « »` → `< > << >>` |
+| `numeric` | Canonicalises the *number inside* noisy text: `"- € 1,299.50"` → `"-1299.50"`, `"(1,250)"` → `"-1250"`. Non-numeric strings pass through untouched |
+| `null_tokens` | Placeholder values — `n/a`, `N/A`, `-`, `--`, `none`, `null`, `unknown`, `?`, empty — become JSON `null` |
+
+```jsonc
+{
+  "clean": false,                               // global off; default is
+                                                // ["entities","invisibles","whitespace"]
+  "queries": {
+    "products": {
+      "selector": "div.product",
+      "extract": [
+        // inherit the global mask:
+        { "name": "title", "rule": { "text": true } },
+        // turn the whole chain off for one field:
+        { "name": "raw",   "rule": { "text": true, "clean": false } },
+        // or pick stages for one field:
+        { "name": "price", "rule": { "text": true, "clean": ["entities","whitespace","fold","null_tokens"] } }
+      ]
+    }
+  }
+}
+```
+
+The sieve runs **before** transforms, and the common cases (`entities` +
+`invisibles` + `whitespace`, i.e. the default) are fused into one SIMD-friendly
+single pass over the bytes — pure-ASCII values with no `&` skip straight to
+the whitespace stage.
+
 ## Pagination
 
 ```json
@@ -303,20 +347,26 @@ Shared library: `make shared` → `libbullet_scrape.so`.
 
 | Path | Typical cost |
 |---|---|
-| Regex extract, ~90 KB / 500 nodes | ~1.3 ms / page (bench) |
+| Selector+regex extract, ~91 KB / 500-element page, default sieve on | ~0.8 ms / page (`--bench`, ~3.6× faster than the original parser) |
+| Selector + attribute + text + urljoin (bulk workload) | ~2.0 µs / row (`make bench-full`) |
 | Offline Python `bs.extract` same page | ~280 pages/s process throughput |
 | DOM + XPath | 5–15 ms (tree size dependent) |
 | Network | Dominates real scrapes — raise `max_concurrent` |
+
+Run the numbers yourself: `./bullet-scrape --bench` for the end-to-end page
+benchmark, `make bench-full` (`./bullet_scrape_bench`) for the per-workload
+table (selectors, text, attributes, regex fast-patterns vs `std::regex`).
 
 ### High-performance design points
 
 1. **Bounded worker pool** — `max_concurrent` threads, never unbounded `std::async` fan-out.
 2. **Thread-local curl easy handles** — keep-alive + HTTP/2 with no lock on the fetch hot path.
 3. **Token-bucket rate limiter** — optional global `requests_per_second`.
-4. **Thread-safe regex cache** (`shared_mutex`) — compile once, share across workers.
-5. **Literal-prefix regex anchoring** — patterns with a literal start (e.g. `class="`) are seeded with `memchr`+`memcmp` and only verified anchored by the regex engine, instead of letting the backtracking NFA re-scan every byte.
-6. **Zero-DOM default** — scan raw HTML bytes; XPath is opt-in. The tier-1.5 tag index is a single pass over the document: interned tag names (no per-tag string copies), POD element spans (extraction reads `string_view`s into the page), one shared index for all selector queries on a page.
-7. **Colab build flags** — `-O3 -ffast-math -funroll-loops -march=x86-64-v2`.
+4. **Thread-safe pattern cache** (`shared_mutex`) — detect/compile once, share across workers.
+5. **Fast-pattern regex engine** — common scrape shapes (`literal + [^x]* / .*? + literal`) skip `std::regex` entirely: each match is an anchored `memchr`/`memcmp` scan. Everything else falls back to literal-prefix-seeded `std::regex_search(match_continuous)` instead of letting the backtracking NFA re-scan every byte. A fuzz test proves both engines return byte-identical results.
+6. **Fused cleaning sieve** — the default `entities + invisibles + whitespace` stages share a single pass with lookahead; pure-ASCII values take a zero-allocation fast path.
+7. **Zero-DOM default** — scan raw HTML bytes; XPath is opt-in. The tier-1.5 tag index is a single pass over the document: interned tag names (no per-tag string copies), POD element spans (extraction reads `string_view`s into the page), one shared index for all selector queries on a page.
+8. **Colab build flags** — `-O3 -ffast-math -funroll-loops -march=x86-64-v2`.
 
 ```python
 import os, bullet_scrape as bs

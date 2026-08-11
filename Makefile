@@ -65,6 +65,7 @@ INCDIR   := include
 BUILDDIR := build/obj
 
 LIB_SRCS := \
+    $(SRCDIR)/core/cleaner.cpp \
     $(SRCDIR)/core/config.cpp \
     $(SRCDIR)/core/http_client.cpp \
     $(SRCDIR)/core/extractor.cpp \
@@ -93,9 +94,13 @@ all: bullet-scrape libbullet_scrape.a
 
 # ── Objects ──────────────────────────────────────────────────────────────────
 
+# Header dependencies are auto-generated (-MMD -MP) so touching a header
+# rebuilds the affected objects — plain `.cpp → .o` rules miss that.
+DEPFLAGS = -MMD -MP
+
 $(BUILDDIR)/%.o: $(SRCDIR)/%.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # ── Static library ───────────────────────────────────────────────────────────
 
@@ -132,16 +137,18 @@ bullet-scrape: $(LIB_OBJS) $(CLI_OBJS)
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 
-TEST_SRCS := tests/test_main.cpp tests/test_extractor.cpp
+TEST_SRCS := tests/test_main.cpp tests/test_extractor.cpp tests/test_cleaner.cpp tests/test_regex_engine.cpp
 TEST_OBJS := $(patsubst tests/%.cpp,$(BUILDDIR)/tests/%.o,$(TEST_SRCS))
 
 $(BUILDDIR)/tests/%.o: tests/%.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 bullet_scrape_tests: $(TEST_OBJS) $(LIB_OBJS)
 	$(CXX) $(CXXSTD) $(OPT) -o $@ $(TEST_OBJS) $(LIB_OBJS) $(LDFLAGS)
 	@echo "Built: ./bullet_scrape_tests"
+
+-include $(LIB_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 
 .PHONY: test
 test: bullet_scrape_tests
@@ -156,6 +163,15 @@ bench: bullet-scrape
 	@echo "=== Running micro-benchmark ==="
 	./bullet-scrape --bench
 	@echo "=== Done ==="
+
+# Detailed extraction benchmark (workload table)
+bullet_scrape_bench: bench/bench.cpp $(LIB_OBJS)
+	$(CXX) $(CXXFLAGS) $(OPT) -o $@ bench/bench.cpp $(LIB_OBJS) $(LDFLAGS)
+	@echo "Built: ./bullet_scrape_bench"
+
+.PHONY: bench-full
+bench-full: bullet_scrape_bench
+	./bullet_scrape_bench
 
 .PHONY: example
 example: bullet-scrape

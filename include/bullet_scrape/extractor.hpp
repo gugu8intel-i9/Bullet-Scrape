@@ -1,4 +1,5 @@
 #pragma once
+#include "bullet_scrape/cleaner.hpp"
 #include "bullet_scrape/config.hpp"
 #include <cstdint>
 #include <deque>
@@ -18,26 +19,31 @@ class ExtractionEngine {
 public:
     // Run all configured queries against `html`, returning one Record per
     // matched element (for collection queries) or a single Record (scalar).
+    // Queries are evaluated in name order, so record ordering is
+    // deterministic even though the config container is unordered.
     //
     // `base_url` is used to resolve relative URLs in `urljoin` transforms.
+    // `is_html = false` switches to bulk text mode for regex queries over
+    // non-HTML payloads (JSON/CSV/logs): values are not tag-stripped or
+    // entity-decoded during extraction, and '>' carries no special meaning.
+    //
+    // Every extracted value passes through the cleaning "sieve" (see
+    // cleaner.hpp): ScraperConfig::clean is the default stage mask, a rule's
+    // own "clean" overrides it. The sieve runs before transforms.
     std::vector<Record> execute(
-        const ScraperConfig&        cfg,
+        const ScraperConfig&         cfg,
         const std::string&           html,
-        const std::string&           base_url = "");
+        const std::string&           base_url = "",
+        bool                          is_html = true);
 
     // Convenience: scalar query → json value
     json execute_scalar(
-        const CollectionQuery&      query,
-        const std::string&          html);
+        const CollectionQuery&       query,
+        const std::string&           html,
+        bool                          is_html = true);
 
 private:
-    // ── Tier-1: regex-based extraction ─────────────────────────────────────
-
-    // Find all regex matches in text
-    static std::vector<std::string> regex_find_all(
-        std::string_view text, const std::string& pattern);
-
-    // ── Tier-2: tag-level extraction (no full DOM, just tag boundaries) ────
+    // ── Tier-1.5: tag-level extraction (no full DOM, just tag boundaries) ───
 
     // One indexed element: byte offsets into the source HTML + an id into
     // Document::tag_names (interned, lowercased).
@@ -54,7 +60,7 @@ private:
     // Built once per page and shared by all selector queries in `execute`.
     // (Offsets are 32-bit: documents up to 4 GiB.)
     struct Document {
-        std::vector<Element> elements;   // emission (close) order
+        std::vector<Element> elements;      // emission (close) order
         std::deque<std::string> tag_names;  // interned tag-name storage
     };
 
@@ -73,22 +79,28 @@ private:
         const Document& doc, const std::string& html, const std::string& selector);
 
     // Extract attribute value from element HTML.
-    // Scans tag attribute lists only (never text nodes); case-insensitive
-    // attribute name; single/double/unquoted values. The first occurrence —
-    // including descendant tags — wins, so `div.product` can yield the href
-    // of a nested <a>.
+    // The element's own open tag is consulted first; if it lacks the
+    // attribute, descendant tags are scanned and the first occurrence wins,
+    // so `div.product` can yield the href of a nested <a>. Case-insensitive
+    // name; single/double/unquoted values; entities decoded only when present.
     static std::optional<std::string> extract_attribute(
         std::string_view element_html, std::string_view attr);
 
     // Extract visible inner text: strips tags, comments and <script>/<style>
-    // content, decodes HTML entities, collapses whitespace.
-    static std::string extract_text(std::string_view element_html);
+    // content, decodes HTML entities, collapses whitespace. Has a zero-alloc
+    // fast path for text that is already clean. (is_html=false → as-is.)
+    static std::string extract_text(std::string_view element_html,
+                                    bool is_html = true);
 
     // ── Transform & aggregate ───────────────────────────────────────────────
 
-    static json apply_transforms(const std::vector<std::string>& values,
+    // (values by value: they are sieved and transformed in place, then moved
+    // into json). `clean_mask` is the resolved cleaning-stage bitmask for the
+    // rule (0 → sieve off; see cleaner.hpp).
+    static json apply_transforms(std::vector<std::string> values,
                                  const ExtractRule& rule,
-                                 const std::string& base_url);
+                                 const std::string& base_url,
+                                 uint32_t clean_mask);
 
     static json apply_aggregate(const json& transformed,
                                 const ExtractRule& rule,
@@ -98,7 +110,9 @@ private:
 
     json extract_leaf(const SubQuery& sub,
                       std::string_view element_html,
-                      const std::string& base_url);
+                      const std::string& base_url,
+                      bool is_html = true,
+                      uint32_t clean_mask = CLEAN_DEFAULT);
 };
 
 } // namespace bullet_scrape

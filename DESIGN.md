@@ -97,8 +97,19 @@ Regex is fast because:
 - No tree construction
 - No allocator churn per node
 - The entire document is one contiguous block
-- A thread-safe compiled-pattern cache (`shared_mutex`) shared by workers
-- Literal-prefix anchoring: when a pattern starts with ≥2 literal bytes, candidate positions come from `memchr`/`memcmp` and the engine only runs *anchored* at each candidate (`match_continuous`), instead of scanning byte-by-byte
+- A thread-safe pattern cache (`shared_mutex`) shared by workers
+- **Fast-pattern matching**: at compile time each pattern is classified. Shapes
+  that are common in scraping — pure literals, `prefix + [^x]* / [^x]+ /
+  [^x]{m,n} + suffix`, `prefix + (.*?) / (.*) + suffix` — run through a
+  dedicated scanner (`memchr`/`memcmp`, hand-rolled backtracking mirroring
+  ECMAScript greediness) and never touch `std::regex`. A cached analysis means
+  the check runs once per pattern per process.
+- Fallback anchoring: patterns outside those shapes keep `std::regex`, but
+  when they start with ≥2 literal bytes, candidate positions come from
+  `memchr`/`memcmp` and the engine only runs *anchored* at each candidate
+  (`match_continuous`), instead of scanning byte-by-byte.
+- Correctness: `tests/test_regex_engine.cpp` runs a deterministic fuzz plus a
+  fixed corpus through both engines and demands byte-identical match results.
 
 Selector queries add a **tier 1.5 tag index**: one single-pass, quote-aware scan
 of the raw HTML (no DOM) producing POD element spans. It handles comments,
@@ -107,6 +118,28 @@ end tags (`<li>`, `<p>`, `<td>`, …), silently recovers from missing close tags
 and lowercases only tag names — never the document. Extraction (text,
 attributes, regex) then works directly on `std::string_view`s into the page.
 Text extraction decodes HTML entities and collapses whitespace.
+
+### Data cleaning sieve
+
+After extraction and before transforms, every value passes through a
+configurable cleaning pipeline (see `cleaner.hpp`). Stages:
+
+1. `entities` — HTML entity decode (~250 names + decimal/hex numerics with the
+   Windows-1252 correction)
+2. `invisibles` — zero-width / directional / control Unicode cleanup
+3. `whitespace` — Unicode-space normalisation, run collapse, trim
+4. `fold` — smart quotes/dashes/ellipsis → ASCII
+5. `numeric` — canonicalise numbers embedded in noisy text (`- € 1,299.50` →
+   `-1299.50`), leaving non-numeric strings untouched
+6. `null_tokens` — `n/a`, `-`, `none`, … → JSON `null`
+
+The default mask is `entities|invisibles|whitespace`, fused into a single
+lookahead pass (`stage_fused_default`); other combinations run stage-by-stage
+with output-doubling-safe in-place rewrite. Config: a global `"clean"` spec
+(`true`/`false`/name/list) with per-`ExtractRule` overrides (`clean: -1`
+inherits). `int`/`float` transforms independently retry after
+`clean_numeric_inplace`, so messy prices convert even when the `numeric`
+stage is off.
 
 ### Tier 2 — XPath (opt-in, heavy)
 
@@ -251,6 +284,7 @@ When config is sparse, Bullet Scrape fills in:
 - `limits.max_retries`: 0
 - `limits.timeout_ms`: 30000
 - `user_agent`: "BulletScrape/1.0"
+- `clean`: `["entities", "invisibles", "whitespace"]` (the fused sieve default)
 
 ---
 
@@ -327,7 +361,14 @@ import). `scripts/colab_setup.sh` installs deps, builds the `.so` at `-O3`, and
 
 ## Performance Notes
 
-- Regex extraction on a 500 KB HTML page: ~0.5–2 ms depending on number of queries.
+- Selector + regex extraction on a ~91 KB / 500-element page, default sieve
+  enabled: **~0.8 ms/page** (`./bullet-scrape --bench`) — down from ~2.9 ms
+  with the original byte-scan parser (~3.6×), and from ~1.4 ms before the
+  fast-pattern engine landed.
+- Bulk rows (selector + text + attribute + urljoin + sieve): ~2.0 µs/row
+  (`make bench-full` prints the whole per-workload table).
+- Regex fast-patterns are ~10–40 ns per candidate check vs ~200 ns+ for
+  `std::regex_search`; doc-wide scans show the gap clearly in `bench-full`.
 - DOM + XPath on the same page: ~5–15 ms (depends on tree size).
 - Fetch latency dominates for most targets (network RTT). Bullet Scrape minimizes parse time but can't eliminate network latency.
 - With `max_concurrent = 8`, 8 pages fetch in roughly the time of 1 page + queue overhead (assuming same host or warmed connections).

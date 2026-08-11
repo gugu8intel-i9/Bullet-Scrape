@@ -1,4 +1,5 @@
 #include "bullet_scrape/config.hpp"
+#include "bullet_scrape/cleaner.hpp"
 #include "bullet_scrape/exceptions.hpp"
 #include "bullet_scrape/mini_json.hpp"
 #include <fstream>
@@ -11,6 +12,35 @@
 namespace bullet_scrape {
 
 using json = mini_json::json;
+
+// ── Cleaning-sieve spec ─────────────────────────────────────────────────────
+// Accepts:  "clean": true|false
+//           "clean": "fold"
+//           "clean": ["entities", "whitespace", "fold", "numeric", "null_tokens"]
+// `fallback` is returned when the key is absent.
+static uint32_t parse_clean_spec(const json& j, uint32_t fallback) {
+    if (!j.contains("clean")) return fallback;
+    const json& c = j["clean"];
+    if (c.is_bool())   return c.get_bool() ? CLEAN_DEFAULT : 0u;
+    if (c.is_int())    return static_cast<uint32_t>(c.get_int());
+    if (c.is_string()) {
+        auto bit = clean_stage_by_name(c.get_string());
+        if (!bit) throw config_error("unknown cleaner stage: " + c.get_string());
+        return *bit;
+    }
+    if (c.is_array()) {
+        uint32_t mask = 0;
+        for (size_t i = 0; i < c.size(); ++i) {
+            const std::string name = c[i].get_string();
+            auto bit = clean_stage_by_name(name);
+            if (!bit) throw config_error("unknown cleaner stage: " + name);
+            mask |= *bit;
+        }
+        return mask;
+    }
+    throw config_error("'clean' must be true, false, a stage name, or an "
+                       "array of stage names");
+}
 
 // ── ExtractRule ─────────────────────────────────────────────────────────────
 
@@ -33,6 +63,8 @@ void ExtractRule::load(const json& j) {
         join_sep = j["join_sep"].get_string();
     if (j.contains("optional"))
         optional = j["optional"].get_bool();
+    if (j.contains("clean"))
+        clean = static_cast<int>(parse_clean_spec(j, 0));
 }
 
 // ── CollectionQuery ─────────────────────────────────────────────────────────
@@ -156,6 +188,7 @@ void ScraperConfig::load(const json& j, const std::string& /*src*/) {
     method      = json_opt_str(j, "method", "GET");
     body        = json_opt_str(j, "body", "");
     user_agent  = json_opt_str(j, "user_agent", "BulletScrape/1.0");
+    clean       = parse_clean_spec(j, CLEAN_DEFAULT);
 
     load_headers(j, headers);
 
@@ -233,6 +266,14 @@ void ScraperConfig::validate() const {
 
     if (queries.empty())
         throw config_error("no queries defined — add at least one query");
+
+    // A query with no match type can never produce records — catch the typo
+    // here instead of silently returning nothing.
+    for (const auto& [qn, q] : queries) {
+        if (q.selector.empty() && !q.regex && !q.xpath)
+            throw config_error("query '" + qn +
+                "' needs one of: \"selector\", \"regex\", \"xpath\"");
+    }
 
     if (output.format != "json" && output.format != "jsonl" &&
         output.format != "csv" && output.format != "txt" &&

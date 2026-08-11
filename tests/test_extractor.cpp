@@ -3,6 +3,8 @@
 #include "bullet_scrape/mini_json.hpp"
 #include "bullet_scrape/exceptions.hpp"
 #include "test_harness.hpp"
+#include <cmath>
+#include <limits>
 #include <string>
 #include <iostream>
 
@@ -519,5 +521,137 @@ REGISTER_TEST(config_validation_errors) {
         if (e.code == ErrorCode::Config) caught = true;
     }
     return caught;
+}
+
+// ── Regression: selector/attr/urljoin edge cases & bulk mode ────────────────
+
+REGISTER_TEST(selector_attr_value_with_space) {
+    // The old parser split the selector on ANY whitespace, so a space inside
+    // a quoted attr value (`a[href="foo bar"]`) truncated the selector.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "div.wrap > a[href=\"foo bar\"]",
+        "extract": [ { "name": "t", "rule": { "text": true } } ] } }
+    })CFG");
+    auto r = ExtractionEngine().execute(cfg,
+        R"XXX(<div class="wrap"><a href="foo bar">Hit</a><a href="foo">Miss</a></div>)XXX");
+    if (r.size() != 1) { std::cerr << "matched " << r.size() << "\n"; return false; }
+    return r[0]["t"][0].get_string() == "Hit";
+}
+
+REGISTER_TEST(selector_tagless_id_matches_any_tag) {
+    // `#logo` used to consult a fixed list of ~14 common tags only, so an id
+    // on an <img> (or any unlisted tag) never matched.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "selector": "#logo",
+        "extract": [ { "name": "s", "rule": { "attribute": "src" } } ] } }
+    })CFG");
+    auto r = ExtractionEngine().execute(cfg,
+        R"XXX(<custom-el id="other">x</custom-el><img id="logo" src="logo.png">)XXX");
+    if (r.size() != 1) { std::cerr << "matched " << r.size() << "\n"; return false; }
+    return r[0]["s"][0].get_string() == "logo.png";
+}
+
+REGISTER_TEST(urljoin_query_and_fragment) {
+    // urljoin used to mangle "?page=2" / "#frag" links (dropping the base
+    // path or doubling the query). RFC 3986: query/fragment-only references
+    // keep the base document path; the base's own query/fragment drops.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://shop.example.com/cat/1?sort=asc#top",
+      "queries": { "q": { "selector": "a",
+        "extract": [ { "name": "u", "rule": { "attribute": "href", "transform": ["urljoin"] } } ] } }
+    })CFG");
+    auto r = ExtractionEngine().execute(cfg,
+        R"XXX(<a href="?page=2">2</a><a href="#sec">s</a><a href="next">n</a>)XXX",
+        "https://shop.example.com/cat/1?sort=asc#top");
+    if (r.size() != 3) { std::cerr << "matched " << r.size() << "\n"; return false; }
+    const std::string q = r[0]["u"][0].get_string();
+    const std::string f = r[1]["u"][0].get_string();
+    const std::string d = r[2]["u"][0].get_string();
+    if (q != "https://shop.example.com/cat/1?page=2") { std::cerr << q << "\n"; return false; }
+    if (f != "https://shop.example.com/cat/1#sec")    { std::cerr << f << "\n"; return false; }
+    if (d != "https://shop.example.com/cat/next")     { std::cerr << d << "\n"; return false; }
+
+    // Non-hierarchical schemes pass through untouched.
+    r = ExtractionEngine().execute(cfg, R"XXX(<a href="mailto:a@b.c">m</a>)XXX",
+        "https://shop.example.com/cat/1");
+    return r.size() == 1 && r[0]["u"][0].get_string() == "mailto:a@b.c";
+}
+
+REGISTER_TEST(bulk_text_mode) {
+    // is_html=false: the matched bytes are the value — no tag stripping, and
+    // selector queries are skipped. The cleaning sieve still runs (default:
+    // entities + invisibles + whitespace), which suits log/CSV scraping.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "q": { "regex": "ERROR: (.*)",
+        "extract": [ { "name": "m", "rule": {} } ] } }
+    })CFG");
+    // BEL (\x07) and a trailing NBSP inside the captured text; '.'
+    // does not cross the '\n'.
+    const std::string log = "ERROR: disk \x07" "full\xC2\xA0\nINFO ok\n";
+    auto r = ExtractionEngine().execute(cfg, log, "", /*is_html=*/false);
+    if (r.size() != 1) { std::cerr << "records " << r.size() << "\n"; return false; }
+    auto& m = r[0]["m"];
+    if (!m.is_array() || m.size() != 1) { std::cerr << m.dump() << "\n"; return false; }
+    const std::string got = m[0].get_string();
+    if (got != "disk full") { std::cerr << "got: [" << got << "]\n"; return false; }
+
+    // Same run in HTML mode over this markup-free text: identical result.
+    r = ExtractionEngine().execute(cfg, log, "", /*is_html=*/true);
+    return r.size() == 1 && r[0]["m"][0].get_string() == "disk full";
+}
+
+REGISTER_TEST(config_query_needs_match_type) {
+    // A query without selector/regex/xpath can never match — validate() must
+    // reject it instead of silently scraping nothing.
+    ScraperConfig cfg = make_config(R"CFG({
+      "url": "https://example.com",
+      "queries": { "typo": { "seletor": "div", "extract": [] } }
+    })CFG");
+    bool caught = false;
+    try { cfg.validate(); }
+    catch (const ScrapeError& e) { caught = (e.code == ErrorCode::Config); }
+    return caught;
+}
+
+REGISTER_TEST(json_float_formatting_and_specials) {
+    // Regression: float dumping leaked a sticky std::fixed across the whole
+    // object (later ints/strings printed as "1.000000"), and non-finite
+    // doubles emitted invalid JSON ("inf").
+    json j = json::object();
+    j["f"] = 1.5;
+    j["i"] = 42;                                 // must print "42", not "42.000000"
+    j["s"] = "x";
+    j["nan"] = std::numeric_limits<double>::quiet_NaN();
+    j["inf"] = std::numeric_limits<double>::infinity();
+    const std::string s = j.dump();
+    auto back = json::parse(s);                  // must remain parseable
+    if (!back.contains("i") || back["i"].get_int() != 42) {
+        std::cerr << "int mangled: " << s << "\n"; return false;
+    }
+    if (std::fabs(back["f"].get_float() - 1.5) > 1e-12) return false;
+    if (!back["nan"].is_null() || !back["inf"].is_null()) {
+        std::cerr << "non-finite not null: " << s << "\n"; return false;
+    }
+    if (back["s"].get_string() != "x") return false;
+    return true;
+}
+
+REGISTER_TEST(json_unicode_surrogate_roundtrip) {
+    // "\uD83D\uDE00" must join into one 4-byte UTF-8 char (😀), not two
+    // 3-byte surrogate encodings; a lone surrogate becomes U+FFFD.
+    auto j = json::parse(R"XXX(" grin: \uD83D\uDE00, lone: \uD83D ")XXX");
+    const std::string v = j.get_string();
+    if (v.find("\xF0\x9F\x98\x80") == std::string::npos) {
+        std::cerr << "no joined surrogate pair\n"; return false;
+    }
+    if (v.find("\xEF\xBF\xBD") == std::string::npos) {
+        std::cerr << "lone surrogate not replaced\n"; return false;
+    }
+    // round-trip through dump(): the emoji must survive as a \uXXXX pair.
+    auto j2 = json::parse(j.dump());
+    return j2.get_string() == v;
 }
 

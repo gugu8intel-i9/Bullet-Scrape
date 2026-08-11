@@ -57,6 +57,7 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 
 # ── Source files ─────────────────────────────────────────────────────────────
 set(BULLET_SOURCES
+    src/core/cleaner.cpp
     src/core/config.cpp
     src/core/http_client.cpp
     src/core/extractor.cpp
@@ -126,6 +127,8 @@ if(BULLET_BUILD_TESTS)
     add_executable(bullet_scrape_tests
         tests/test_main.cpp
         tests/test_extractor.cpp
+        tests/test_cleaner.cpp
+        tests/test_regex_engine.cpp
     )
     target_link_libraries(bullet_scrape_tests PRIVATE bullet_scrape_static)
     add_test(NAME bullet_scrape_extractor COMMAND bullet_scrape_tests --filter extractor)
