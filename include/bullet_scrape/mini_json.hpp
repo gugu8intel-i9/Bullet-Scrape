@@ -193,16 +193,11 @@ public:
     }
 
     // ── Iteration ────────────────────────────────────────────────────────────
-    object_t::const_iterator begin() const {
-        static object_t empty;
-        if (!is_object()) return empty.end();
-        return std::get<std::shared_ptr<object_t>>(data_)->begin();
-    }
-    object_t::const_iterator end() const {
-        static object_t empty;
-        if (!is_object()) return empty.end();
-        return std::get<std::shared_ptr<object_t>>(data_)->end();
-    }
+    // NOTE: defined out-of-line (below). A function-local `static object_t`
+    // inside the class instantiates unordered_map<std::string, json> while
+    // the class is still being completed — rejected by libstdc++ (GCC ≤ 11).
+    object_t::const_iterator begin() const;
+    object_t::const_iterator end() const;
 
     // ── Serialization ────────────────────────────────────────────────────────
     std::string dump(int indent = -1) const {
@@ -212,6 +207,33 @@ public:
     }
 
 private:
+    // Write a JSON string literal (keys and values alike) with all required
+    // escapes — keys were previously emitted raw and could break the output.
+    static void write_escaped(std::ostringstream& ss, const std::string& s) {
+        static const char* hex_digits = "0123456789abcdef";
+        ss << '"';
+        for (char c : s) {
+            switch (c) {
+                case '"':  ss << "\\\""; break;
+                case '\\': ss << "\\\\"; break;
+                case '\n': ss << "\\n";  break;
+                case '\r': ss << "\\r";  break;
+                case '\t': ss << "\\t";  break;
+                case '\b': ss << "\\b";  break;
+                case '\f': ss << "\\f";  break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        ss << "\\u00"
+                           << hex_digits[(static_cast<unsigned char>(c) >> 4) & 0xF]
+                           << hex_digits[static_cast<unsigned char>(c) & 0xF];
+                    } else {
+                        ss << c;
+                    }
+            }
+        }
+        ss << '"';
+    }
+
     void dump_to(std::ostringstream& ss, int indent, int level) const {
         if (is_null())   { ss << "null"; return; }
         if (is_bool())   { ss << (get_bool() ? "true" : "false"); return; }
@@ -225,25 +247,7 @@ private:
             return;
         }
         if (is_string()) {
-            ss << '"';
-            for (char c : get_string()) {
-                switch (c) {
-                    case '"':  ss << "\\\""; break;
-                    case '\\': ss << "\\\\"; break;
-                    case '\n': ss << "\\n";  break;
-                    case '\r': ss << "\\r";  break;
-                    case '\t': ss << "\\t";  break;
-                    default:
-                        if (static_cast<unsigned char>(c) < 0x20)
-                            ss << "\\u"
-                               << std::hex << std::setw(4) << std::setfill('0')
-                               << static_cast<int>(static_cast<unsigned char>(c))
-                               << std::dec << std::setfill(' ');
-                        else
-                            ss << c;
-                }
-            }
-            ss << '"';
+            write_escaped(ss, get_string());
             return;
         }
         if (is_array()) {
@@ -279,7 +283,8 @@ private:
                 for (auto& [k, v] : obj) {
                     if (!first) ss << ",";
                     first = false;
-                    ss << '"' << k << '"' << ":";
+                    write_escaped(ss, k);
+                    ss << ":";
                     v.dump_to(ss, -1, 0);
                 }
                 ss << "}";
@@ -291,7 +296,9 @@ private:
                 for (auto& [k, v] : obj) {
                     if (!first) ss << ",\n";
                     first = false;
-                    ss << pad << '"' << k << '"' << ": ";
+                    ss << pad;
+                    write_escaped(ss, k);
+                    ss << ": ";
                     v.dump_to(ss, indent, level + 1);
                 }
                 ss << "\n" << pad0 << "}";
@@ -305,7 +312,12 @@ private:
 public:
     static json parse(const std::string& s) {
         json_parser p{s};
-        return p.parse_value();
+        json v = p.parse_value();
+        p.skip_ws();
+        if (p.pos != s.size())
+            throw std::runtime_error("json: trailing data at pos " +
+                                     std::to_string(p.pos));
+        return v;
     }
 
     static json parse_file(const std::string& path) {
@@ -371,7 +383,21 @@ private:
 
         json parse_string() {
             expect('"');
-            std::string out;
+            // Fast path: bulk-copy until the closing quote when there are no
+            // escape sequences (the overwhelmingly common case).
+            const size_t start = pos;
+            while (pos < s.size()) {
+                char c = s[pos];
+                if (c == '"') {
+                    std::string out = s.substr(start, pos - start);
+                    ++pos;
+                    return json(std::move(out));
+                }
+                if (c == '\\') break;
+                ++pos;
+            }
+            // Slow path: escape handling.
+            std::string out = s.substr(start, pos - start);
             while (pos < s.size()) {
                 char c = s[pos++];
                 if (c == '"') return json(std::move(out));
@@ -479,6 +505,23 @@ private:
         }
     };
 };
+
+// ── Out-of-line iteration definitions (see note in-class) ───────────────────
+namespace detail {
+inline const json::object_t& empty_object_map() {
+    static const json::object_t empty;
+    return empty;
+}
+} // namespace detail
+
+inline json::object_t::const_iterator json::begin() const {
+    if (!is_object()) return detail::empty_object_map().end();
+    return std::get<std::shared_ptr<object_t>>(data_)->begin();
+}
+inline json::object_t::const_iterator json::end() const {
+    if (!is_object()) return detail::empty_object_map().end();
+    return std::get<std::shared_ptr<object_t>>(data_)->end();
+}
 
 // ── Convenience functions ────────────────────────────────────────────────────
 inline json json_parse(const std::string& s)     { return json::parse(s); }

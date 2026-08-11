@@ -97,6 +97,16 @@ Regex is fast because:
 - No tree construction
 - No allocator churn per node
 - The entire document is one contiguous block
+- A thread-safe compiled-pattern cache (`shared_mutex`) shared by workers
+- Literal-prefix anchoring: when a pattern starts with ≥2 literal bytes, candidate positions come from `memchr`/`memcmp` and the engine only runs *anchored* at each candidate (`match_continuous`), instead of scanning byte-by-byte
+
+Selector queries add a **tier 1.5 tag index**: one single-pass, quote-aware scan
+of the raw HTML (no DOM) producing POD element spans. It handles comments,
+CDATA, `<script>`/`<style>` raw-text, void/self-closing tags and HTML5 implied
+end tags (`<li>`, `<p>`, `<td>`, …), silently recovers from missing close tags,
+and lowercases only tag names — never the document. Extraction (text,
+attributes, regex) then works directly on `std::string_view`s into the page.
+Text extraction decodes HTML entities and collapses whitespace.
 
 ### Tier 2 — XPath (opt-in, heavy)
 

@@ -2,339 +2,877 @@
 #include "bullet_scrape/exceptions.hpp"
 #include <algorithm>
 #include <cctype>
-#include <set>
-#include <sstream>
-#include <iomanip>
+#include <cstring>
 #include <mutex>
+#include <regex>
+#include <set>
 #include <shared_mutex>
+#include <string_view>
+#include <unordered_set>
+
+// Byte-level substring search: SIMD-accelerated memchr on the first byte,
+// memcmp to confirm. (memmem is a GNU extension hidden in strict C++17 mode.)
+static const char* find_bytes(const char* hay, size_t n,
+                              const char* needle, size_t m) noexcept {
+    if (m == 0) return hay;
+    if (n < m)  return nullptr;
+    const char* last = hay + (n - m);          // last position a match can start
+    for (;;) {
+        const char* p = static_cast<const char*>(
+            std::memchr(hay, needle[0], (last - hay) + 1));
+        if (!p) return nullptr;
+        if (m == 1 || std::memcmp(p + 1, needle + 1, m - 1) == 0) return p;
+        hay = p + 1;
+    }
+}
 
 namespace bullet_scrape {
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Small text helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+static inline bool is_ws(char c) noexcept {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+static std::string trim_str(const std::string& s) {
+    size_t start = 0, end = s.size();
+    while (start < end && is_ws(s[start])) ++start;
+    while (end > start && is_ws(s[end - 1])) --end;
+    return s.substr(start, end - start);
+}
+
+static inline bool ci_eq(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        char x = a[i], y = b[i];
+        if (x >= 'A' && x <= 'Z') x += ('a' - 'A');
+        if (y >= 'A' && y <= 'Z') y += ('a' - 'A');
+        if (x != y) return false;
+    }
+    return true;
+}
+
+static std::string to_lower(std::string_view s) {
+    std::string out(s);
+    for (auto& c : out)
+        if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
+    return out;
+}
+
+// Case-insensitive search for a lowercase literal. First match at ≥ `from`.
+static size_t find_ci(std::string_view hay, size_t from, const char* needle_lc) {
+    const size_t nl = std::strlen(needle_lc);
+    const size_t n  = hay.size();
+    if (nl == 0) return from <= n ? from : std::string_view::npos;
+    if (from + nl > n) return std::string_view::npos;
+    const char f0 = needle_lc[0];
+    const char f1 = f0 >= 'a' && f0 <= 'z' ? static_cast<char>(f0 - 'a' + 'A') : f0;
+    const char* d = hay.data();
+    for (size_t i = from; i + nl <= n; ++i) {
+        if (d[i] != f0 && d[i] != f1) continue;
+        size_t k = 1;
+        for (; k < nl; ++k) {
+            char c = d[i + k];
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'a' + 'A');
+            if (c != needle_lc[k]) break;
+        }
+        if (k == nl) return i;
+    }
+    return std::string_view::npos;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  HTML entities
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Try to decode the entity starting at s[pos] (which must be '&').
+// If recognised, appends the decoded text to `out`, advances `pos` past the
+// terminating ';' and returns true; otherwise leaves both untouched and
+// returns false.
+static bool decode_entity(const std::string_view s, size_t& pos, std::string& out) {
+    size_t semi = s.find(';', pos + 1);
+    if (semi == std::string_view::npos || semi - pos > 10) return false;
+    const std::string_view e = s.substr(pos + 1, semi - pos - 1);
+
+    // Numeric: &#123; or &#x1F;
+    if (!e.empty() && e[0] == '#') {
+        unsigned long cp = 0;
+        size_t i = 1;
+        const bool hex = i < e.size() && (e[i] == 'x' || e[i] == 'X');
+        if (hex) ++i;
+        if (i >= e.size()) return false;
+        for (; i < e.size(); ++i) {
+            char c = e[i];
+            int d;
+            if (c >= '0' && c <= '9') d = c - '0';
+            else if (hex && c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            else if (hex && c >= 'A' && c <= 'F') d = c - 'A' + 10;
+            else return false;
+            if (!hex && d > 9) return false;
+            cp = cp * (hex ? 16u : 10u) + static_cast<unsigned>(d);
+            if (cp > 0x10FFFFu) return false;
+        }
+        if (cp == 0 || cp > 0x10FFFFu) return false;
+        pos = semi + 1;
+        if (cp < 0x80) {
+            out += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            out += static_cast<char>(0xC0 | (cp >> 6));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += static_cast<char>(0xE0 | (cp >> 12));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            out += static_cast<char>(0xF0 | (cp >> 18));
+            out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+        return true;
+    }
+
+    // Named entities — the common set used in real-world markup.
+    struct Named { const char* name; const char* val; };
+    static const Named kNamed[] = {
+        {"amp", "&"}, {"lt", "<"}, {"gt", ">"}, {"quot", "\""}, {"apos", "'"},
+        {"nbsp", " "}, {"copy", "\xC2\xA9"}, {"reg", "\xC2\xAE"}, {"deg", "\xC2\xB0"},
+        {"mdash", "\xE2\x80\x94"}, {"ndash", "\xE2\x80\x93"}, {"hellip", "\xE2\x80\xA6"},
+        {"laquo", "\xC2\xAB"}, {"raquo", "\xC2\xBB"}, {"euro", "\xE2\x82\xAC"},
+        {"pound", "\xC2\xA3"}, {"yen", "\xC2\xA5"}, {"cent", "\xC2\xA2"},
+        {"trade", "\xE2\x84\xA2"}, {"middot", "\xC2\xB7"}, {"bull", "\xE2\x80\xA2"},
+        {"lsquo", "\xE2\x80\x98"}, {"rsquo", "\xE2\x80\x99"}, {"ldquo", "\xE2\x80\x9C"},
+        {"rdquo", "\xE2\x80\x9D"}, {"times", "\xC3\x97"}, {"divide", "\xC3\xB7"},
+        {"plusmn", "\xC2\xB1"}, {"frac12", "\xC2\xBD"}, {"frac14", "\xC2\xBC"},
+        {"frac34", "\xC2\xBE"}, {"sect", "\xC2\xA7"}, {"para", "\xC2\xB6"},
+        {"micro", "\xC2\xB5"}, {"iexcl", "\xC2\xA1"}, {"iquest", "\xC2\xBF"},
+        {"szlig", "\xC3\x9F"}, {"egrave", "\xC3\xA8"}, {"eacute", "\xC3\xA9"},
+        {"agrave", "\xC3\xA0"}, {"aacute", "\xC3\xA1"}, {"ccedil", "\xC3\xA7"},
+        {"ntilde", "\xC3\xB1"}, {"uuml", "\xC3\xBC"}, {"ouml", "\xC3\xB6"},
+        {"auml", "\xC3\xA4"}, {"Uuml", "\xC3\x9C"}, {"Ouml", "\xC3\x96"},
+        {"Auml", "\xC3\x84"},
+    };
+    for (const auto& nd : kNamed) {
+        if (e == nd.name) {
+            out += nd.val;
+            pos = semi + 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool has_entity(std::string_view s) {
+    return s.find('&') != std::string_view::npos;
+}
+
+static std::string decode_entities(std::string_view s) {
+    if (!has_entity(s)) return std::string(s);
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        if (s[i] == '&' && decode_entity(s, i, out)) continue;
+        out += s[i];
+        ++i;
+    }
+    return out;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Regex helpers (private static members of ExtractionEngine)
 // ═══════════════════════════════════════════════════════════════════════════
 
-static std::regex make_regex(const std::string& pattern) {
-    try {
-        return std::regex(pattern, std::regex::ECMAScript | std::regex::optimize);
-    } catch (const std::regex_error&) {
-        return std::regex("^$");
+// Count capturing groups in an ECMAScript pattern: skips escapes, character
+// classes, and non-capturing constructs ( (?:, (?=, (?! … ).
+static int count_capture_groups(const std::string& pattern) {
+    int groups = 0;
+    bool escaped = false, in_class = false;
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        char ch = pattern[i];
+        if (escaped)   { escaped = false; continue; }
+        if (ch == '\\') { escaped = true;  continue; }
+        if (in_class)  { if (ch == ']') in_class = false; continue; }
+        if (ch == '[') { in_class = true;  continue; }
+        if (ch == '(') {
+            if (i + 1 < pattern.size() && pattern[i + 1] == '?') continue; // (?: (?= (?! ...
+            ++groups;
+        }
     }
+    return groups;
 }
 
-// Thread-safe regex cache for concurrent workers (shared_mutex = many readers).
-// Patterns are stable for a job, so the hot path is almost always a shared lock hit.
-static std::unordered_map<std::string, std::regex> regex_cache;
-static std::shared_mutex regex_cache_mu;
+namespace {
 
-static const std::regex& get_cached_regex(const std::string& pattern) {
+// Compiled-pattern cache shared across worker threads. Patterns are stable
+// for a job, so the hot path is a shared-lock hit. Compile failures are
+// cached too and surfaced as config errors instead of being silently
+// replaced with a never-matching pattern.
+struct CachedRegex {
+    std::regex re;
+    bool valid = false;
+};
+
+std::unordered_map<std::string, CachedRegex> g_regex_cache;
+std::shared_mutex g_regex_cache_mu;
+
+const CachedRegex& get_cached_regex(const std::string& pattern) {
     {
-        std::shared_lock lk(regex_cache_mu);
-        auto it = regex_cache.find(pattern);
-        if (it != regex_cache.end()) return it->second;
+        std::shared_lock lk(g_regex_cache_mu);
+        auto it = g_regex_cache.find(pattern);
+        if (it != g_regex_cache.end()) return it->second;
     }
-    std::unique_lock lk(regex_cache_mu);
-    auto it = regex_cache.find(pattern);
-    if (it != regex_cache.end()) return it->second;
-    auto re = make_regex(pattern);
-    return regex_cache.emplace(pattern, std::move(re)).first->second;
+    std::unique_lock lk(g_regex_cache_mu);
+    auto it = g_regex_cache.find(pattern);
+    if (it != g_regex_cache.end()) return it->second;
+
+    CachedRegex entry;
+    try {
+        entry.re = std::regex(pattern, std::regex::ECMAScript | std::regex::optimize);
+        entry.valid = true;
+    } catch (const std::regex_error&) {
+        entry.valid = false;
+    }
+    return g_regex_cache.emplace(pattern, std::move(entry)).first->second;
+}
+
+// Throws if the pattern cannot be compiled (a misconfiguration, not silence).
+const std::regex& compiled_regex(const std::string& pattern, const char* context) {
+    const CachedRegex& entry = get_cached_regex(pattern);
+    if (!entry.valid)
+        throw config_error(std::string("invalid regex in ") + context + ": " + pattern);
+    return entry.re;
+}
+
+} // anonymous namespace
+
+// ── Match scanning with a literal-prefix anchor ─────────────────────────────
+
+// The longest run of characters the pattern must match *at the start* of
+// every match ("" when the pattern has no literal anchor).
+static std::string literal_prefix(const std::string& pattern) {
+    static const std::string kMeta = "^$.[]{}()*+?|\\";
+    std::string out;
+    for (char c : pattern) {
+        if (kMeta.find(c) != std::string::npos) break;
+        out += c;
+    }
+    // A quantifier applies to the last literal char only: "ab*"/"ab?"/"ab{0}"
+    // can match just "a", so that char is not a required part of the prefix.
+    if (!out.empty() && out.size() < pattern.size()) {
+        const char next = pattern[out.size()];
+        if (next == '*' || next == '?' || next == '{')
+            out.pop_back();
+    }
+    return out;
+}
+
+// Call `on_match` for every successive non-overlapping match of `re` in
+// `text`. When the pattern has a literal prefix, candidate positions are
+// found with memchr+memcmp and the engine is only invoked anchored at each
+// candidate — libstdc++'s resumable iterator re-scans the whole string with
+// its backtracking engine, which this avoids.
+using sv_match_iter = std::regex_iterator<std::string_view::const_iterator>;
+using sv_match      = std::match_results<std::string_view::const_iterator>;
+
+template <typename F>
+static void scan_matches(std::string_view text, const std::string& pattern,
+                         const std::regex& re, F&& on_match) {
+    const std::string prefix = literal_prefix(pattern);
+    if (prefix.size() < 2) {                       // no useful anchor
+        for (sv_match_iter it(text.begin(), text.end(), re), end; it != end; ++it)
+            on_match(*it);
+        return;
+    }
+
+    const char* data = text.data();
+    const size_t n = text.size();
+    size_t pos = 0;
+    while (pos + prefix.size() <= n) {
+        const char* hit = find_bytes(data + pos, n - pos, prefix.data(), prefix.size());
+        if (!hit) break;
+        const size_t off = static_cast<size_t>(hit - data);
+        sv_match m;
+        if (std::regex_search(text.begin() + static_cast<ptrdiff_t>(off), text.end(), m, re,
+                              std::regex_constants::match_continuous)) {
+            on_match(m);
+            const size_t mend = off + static_cast<size_t>(m.length(0));
+            pos = mend > off ? mend : off + 1;     // empty matches advance by one
+        } else {
+            pos = off + 1;
+        }
+    }
 }
 
 std::vector<std::string> ExtractionEngine::regex_find_all(
-        const std::string& text, const std::string& pattern) {
+        std::string_view text, const std::string& pattern) {
     std::vector<std::string> out;
-    const auto& re = get_cached_regex(pattern);
-    auto begin = std::sregex_iterator(text.begin(), text.end(), re);
-    auto end   = std::sregex_iterator();
-    for (auto it = begin; it != end; ++it)
-        out.push_back(it->str());
+    const auto& re = compiled_regex(pattern, "rule");
+    scan_matches(text, pattern, re,
+                 [&out](const auto& m) { out.push_back(m.str(0)); });
     return out;
 }
 
-std::vector<std::vector<std::string>> ExtractionEngine::regex_find_captures(
-        const std::string& text, const std::string& pattern, int groups) {
-    std::vector<std::vector<std::string>> out;
-    const auto& re = get_cached_regex(pattern);
-    auto begin = std::sregex_iterator(text.begin(), text.end(), re);
-    auto end   = std::sregex_iterator();
-    for (auto it = begin; it != end; ++it) {
-        std::vector<std::string> caps;
-        for (int i = 0; i <= groups && i < (int)it->size(); ++i)
-            caps.push_back(it->str(i));
-        out.push_back(std::move(caps));
+// ═══════════════════════════════════════════════════════════════════════════
+//  HTML scanning primitives (single pass, quote-aware)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static inline bool is_tag_name_start(char c) noexcept {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+static inline bool is_tag_name_char(char c) noexcept {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '-' || c == '_' || c == ':';
+}
+
+// Position of the '>' terminating the tag that starts (with '<') before `pos`,
+// honouring single/double quoted attribute values, or npos if unterminated.
+static size_t find_tag_end(std::string_view s, size_t pos) {
+    char quote = 0;
+    for (size_t i = pos; i < s.size(); ++i) {
+        char c = s[i];
+        if (quote) {
+            if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (c == '>') return i;
     }
-    return out;
+    return std::string::npos;
+}
+
+// HTML void elements — never have content or a close tag.
+static bool is_void_element(const std::string& tag) noexcept {
+    static const char* const kVoid[] = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr"
+    };
+    for (const char* v : kVoid)
+        if (tag == v) return true;
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Document index
+// ═══════════════════════════════════════════════════════════════════════════
+
+static bool is_heading_tag(std::string_view t) {
+    return t.size() == 2 && t[0] == 'h' && t[1] >= '1' && t[1] <= '6';
+}
+
+// HTML5 implied-end-tag rules (condensed to the cases that matter for
+// scraping): the named opening tag implicitly closes the listed open ones —
+// e.g. `<li>` closes a pending `<li>`, any block element closes a `<p>`.
+static bool implies_close(std::string_view nw, std::string_view cur) {
+    if (nw == "li")          return cur == "li" || cur == "dt" || cur == "dd";
+    if (nw == "dt" || nw == "dd") return cur == "dt" || cur == "dd" || cur == "li";
+    if (nw == "td" || nw == "th") return cur == "td" || cur == "th";
+    if (nw == "tr")          return cur == "tr" || cur == "td" || cur == "th";
+    if (nw == "option")      return cur == "option";
+    if (nw == "optgroup")    return cur == "option" || cur == "optgroup";
+    if (nw == "thead" || nw == "tbody" || nw == "tfoot")
+        return cur == "thead" || cur == "tbody" || cur == "tfoot" ||
+               cur == "tr" || cur == "td" || cur == "th";
+    if (is_heading_tag(nw))  return is_heading_tag(cur);
+    return false;
+}
+
+// Any block-level opener implicitly ends a pending <p>.
+static bool closes_paragraph(std::string_view nw) {
+    static const std::unordered_set<std::string_view> kBlocks = {
+        "p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "dl",
+        "table", "section", "article", "aside", "header", "hgroup", "footer",
+        "nav", "pre", "blockquote", "form", "fieldset", "address", "hr",
+        "main", "figure", "figcaption", "details", "summary"
+    };
+    return kBlocks.count(nw) != 0;
+}
+
+ExtractionEngine::Document ExtractionEngine::parse_document(const std::string& html) {
+    // 32-bit offsets: documents up to 4 GiB (originally a static_cast bug
+    // truncated offsets to int — better to refuse than silently corrupt).
+    if (html.size() > UINT32_MAX)
+        throw extract_error("page", "document too large to index (>= 4 GiB)");
+
+    Document doc;
+    doc.elements.reserve(512);
+
+    // Tag-name interning without per-event allocation: tag ids index into
+    // doc.tag_names (lowercased). New names are rare, so a linear scan over
+    // the distinct names (kept as views into the document, compared
+    // case-insensitively) beats a hashing std::string copy per tag event.
+    std::vector<std::string_view> name_views;
+    auto intern = [&](size_t start, size_t len) -> uint32_t {
+        const std::string_view v(html.data() + start, len);
+        for (uint32_t id = 0; id < name_views.size(); ++id)
+            if (name_views[id].size() == len && ci_eq(name_views[id], v))
+                return id;
+        doc.tag_names.push_back(to_lower(v));
+        name_views.push_back(v);
+        return static_cast<uint32_t>(name_views.size() - 1);
+    };
+
+    // Single open-tag stack (browser-style): a close tag implicitly closes
+    // any elements opened inside it.
+    struct Open { uint32_t tag, pos, gt; };
+    std::vector<Open> stack;
+    stack.reserve(64);
+
+    auto emit = [&](uint32_t tag, size_t open, size_t open_gt,
+                    size_t close, size_t end) {
+        doc.elements.push_back(Element{
+            tag, static_cast<uint32_t>(open), static_cast<uint32_t>(open_gt),
+            static_cast<uint32_t>(open_gt + 1),
+            static_cast<uint32_t>(close), static_cast<uint32_t>(end)});
+    };
+
+    const size_t n = html.size();
+    size_t i = 0;
+    while (i + 1 < n) {
+        if (html[i] != '<') { ++i; continue; }
+        const char c1 = html[i + 1];
+
+        // ── Markup declarations: comments, doctype, CDATA ─────────────────
+        if (c1 == '!') {
+            if (html.compare(i + 2, 2, "--") == 0) {            // <!-- comment -->
+                const size_t e = html.find("-->", i + 4);
+                i = (e == std::string::npos) ? n : e + 3;
+                continue;
+            }
+            if (html.compare(i + 2, 7, "[CDATA[") == 0) {       // <![CDATA[ ... ]]>
+                const size_t e = html.find("]]>", i + 9);
+                i = (e == std::string::npos) ? n : e + 3;
+                continue;
+            }
+            const size_t gt = html.find('>', i + 2);            // <!DOCTYPE html>
+            i = (gt == std::string::npos) ? n : gt + 1;
+            continue;
+        }
+        if (c1 == '?') {                                        // <?php / xml prolog ?>
+            const size_t gt = html.find('>', i + 2);
+            i = (gt == std::string::npos) ? n : gt + 1;
+            continue;
+        }
+
+        const bool closing = (c1 == '/');
+        const size_t name_start = i + 1 + (closing ? 1 : 0);
+        if (name_start >= n || !is_tag_name_start(html[name_start])) { ++i; continue; }
+
+        size_t j = name_start + 1;
+        while (j < n && is_tag_name_char(html[j])) ++j;
+        const std::string_view name_v(html.data() + name_start, j - name_start);
+
+        // ── <script>/<style> open tags: raw-text content is not HTML ──────
+        if (!closing && (ci_eq(name_v, "script") || ci_eq(name_v, "style"))) {
+            const size_t gt = find_tag_end(html, j);
+            if (gt == std::string::npos) break;
+            size_t k = gt;
+            while (k > j && is_ws(html[k - 1])) --k;
+            const bool self_closing = k > j && html[k - 1] == '/';
+            const uint32_t id = intern(name_start, j - name_start);
+            if (self_closing) {
+                emit(id, i, gt, gt + 1, gt + 1);
+                i = gt + 1;
+                continue;
+            }
+            const char* close_pat = ci_eq(name_v, "script") ? "</script" : "</style";
+            const size_t cp = find_ci(html, gt + 1, close_pat);
+            if (cp == std::string::npos) {
+                emit(id, i, gt, n, n);
+                break;
+            }
+            const size_t close_gt = find_tag_end(html, cp + 2 + name_v.size());
+            const size_t end = (close_gt == std::string::npos) ? n : close_gt + 1;
+            emit(id, i, gt, cp, end);
+            i = end;
+            continue;
+        }
+
+        const uint32_t id = intern(name_start, j - name_start);
+
+        if (closing) {
+            // Find the nearest matching open tag; implicitly close anything
+            // opened inside it (recovers from missing close tags).
+            bool found = false;
+            for (size_t d = stack.size(); d-- > 0;) {
+                if (stack[d].tag != id) continue;
+                found = true;
+                const size_t gt = find_tag_end(html, j);
+                const size_t close_end = (gt == std::string::npos) ? n : gt + 1;
+                for (size_t u = stack.size(); u-- > d + 1;)
+                    emit(stack[u].tag, stack[u].pos, stack[u].gt, i, i);
+                emit(id, stack[d].pos, stack[d].gt, i, close_end);
+                stack.resize(d);
+                i = close_end;
+                break;
+            }
+            if (!found) {   // unmatched close tag — skip it
+                const size_t gt = html.find('>', j);
+                i = (gt == std::string::npos) ? n : gt + 1;
+            }
+            continue;
+        }
+
+        // ── Opening tag ────────────────────────────────────────────────────
+        const size_t gt = find_tag_end(html, j);
+        if (gt == std::string::npos) break;                     // unterminated tag at EOF
+        size_t k = gt;
+        while (k > j && is_ws(html[k - 1])) --k;                // allow `<br />`
+        const bool self_closing = k > j && html[k - 1] == '/';
+
+        if (self_closing || is_void_element(doc.tag_names[id]))
+            emit(id, i, gt, gt + 1, gt + 1);                    // empty content span
+        else {
+            // Implied end tags: `<li>` auto-closes a pending `<li>`, a block
+            // opener closes a pending `<p>`, etc. (browser behaviour).
+            const std::string& new_tag = doc.tag_names[id];
+            while (!stack.empty()) {
+                const std::string& top_tag = doc.tag_names[stack.back().tag];
+                if (top_tag == "p" && closes_paragraph(new_tag)) {
+                    emit(stack.back().tag, stack.back().pos, stack.back().gt, i, i);
+                    stack.pop_back();
+                    continue;
+                }
+                if (implies_close(new_tag, top_tag)) {
+                    emit(stack.back().tag, stack.back().pos, stack.back().gt, i, i);
+                    stack.pop_back();
+                    continue;
+                }
+                break;
+            }
+            stack.push_back(Open{id, static_cast<uint32_t>(i),
+                                 static_cast<uint32_t>(gt)});
+        }
+        i = gt + 1;
+    }
+
+    // Implicit close at EOF for anything left open — deepest first.
+    while (!stack.empty()) {
+        emit(stack.back().tag, stack.back().pos, stack.back().gt, n, n);
+        stack.pop_back();
+    }
+
+    return doc;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Selector parsing & matching (CSS-selector-lite)
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct AttrSelector {
+    std::string name;
+    std::string value;      // empty → presence check only
+    bool has_value = false;
+};
+
+struct ParsedSelector {
+    std::string tag;                    // empty → any of the default tag set
+    std::string id;
+    std::vector<std::string> classes;
+    std::vector<AttrSelector> attrs;
+};
+
+// Parse one simple-selector segment (`div#a.b[x="y"]`). Anything that cannot
+// belong to a simple selector is skipped, so callers can pass the rightmost
+// segment of a compound selector.
+static ParsedSelector parse_simple_selector(std::string_view sv) {
+    ParsedSelector ps;
+    size_t i = 0;
+    const size_t n = sv.size();
+
+    auto is_name_char = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '*' ||
+               c == ':' || c == '|';
+    };
+
+    if (i < n && (is_name_char(sv[i]) || sv[i] == '*')) {
+        const size_t start = i;
+        while (i < n && is_name_char(sv[i])) ++i;
+        if (sv[start] != '*') ps.tag = to_lower(sv.substr(start, i - start));
+    }
+
+    while (i < n) {
+        const char c = sv[i];
+        if (c == '#') {
+            const size_t s = ++i;
+            while (i < n && is_name_char(sv[i])) ++i;
+            ps.id = std::string(sv.substr(s, i - s));
+        } else if (c == '.') {
+            const size_t s = ++i;
+            while (i < n && is_name_char(sv[i])) ++i;
+            if (i > s) ps.classes.emplace_back(sv.substr(s, i - s));
+        } else if (c == '[') {
+            // Find the matching ']' honouring quoted values.
+            size_t e = i + 1;
+            char quote = 0;
+            for (; e < n; ++e) {
+                char q = sv[e];
+                if (quote) { if (q == quote) quote = 0; continue; }
+                if (q == '"' || q == '\'') { quote = q; continue; }
+                if (q == ']') break;
+            }
+            if (e >= n) break;
+            std::string_view body = sv.substr(i + 1, e - i - 1);
+            i = e + 1;
+            // Trim whitespace
+            while (!body.empty() && is_ws(body.front())) body.remove_prefix(1);
+            while (!body.empty() && is_ws(body.back()))  body.remove_suffix(1);
+            AttrSelector as;
+            const size_t eq = body.find('=');
+            if (eq == std::string_view::npos) {
+                as.name = to_lower(body);
+            } else {
+                as.name  = to_lower(body.substr(0, eq));
+                while (!as.name.empty() && is_ws(as.name.back())) as.name.pop_back();
+                std::string_view v = body.substr(eq + 1);
+                while (!v.empty() && is_ws(v.front())) v.remove_prefix(1);
+                while (!v.empty() && is_ws(v.back()))  v.remove_suffix(1);
+                if (v.size() >= 2 &&
+                    ((v.front() == '"' && v.back() == '"') ||
+                     (v.front() == '\'' && v.back() == '\'')))
+                    v = v.substr(1, v.size() - 2);
+                as.value = std::string(v);
+                as.has_value = true;
+            }
+            if (!as.name.empty()) ps.attrs.push_back(std::move(as));
+        } else {
+            ++i;  // whitespace, combinators, pseudo-classes: out of scope
+        }
+    }
+    return ps;
+}
+
+static ParsedSelector parse_selector(const std::string& sel) {
+    // For compound selectors keep only the rightmost simple segment —
+    // e.g. `div.card > a` behaves like `a`, `ul li` behaves like `li`.
+    size_t end = sel.size();
+    while (end > 0 && (is_ws(sel[end - 1]) || sel[end - 1] == '>' ||
+                       sel[end - 1] == '+' || sel[end - 1] == '~'))
+        --end;
+    size_t begin = end;
+    while (begin > 0) {
+        const char c = sel[begin - 1];
+        if (is_ws(c) || c == '>' || c == '+' || c == '~') break;
+        --begin;
+    }
+    return parse_simple_selector(std::string_view(sel).substr(begin, end - begin));
+}
+
+// ── Attribute lookup ────────────────────────────────────────────────────────
+
+// Lex one open tag's attribute list without allocating: `open_tag` must start
+// at '<' (any '>' termination works). Returns the raw (undecoded) value view
+// of the (case-insensitively) named attribute, an empty view for valueless
+// attributes, or nullopt when the attribute is not present.
+static std::optional<std::string_view> find_attr_value(std::string_view open_tag,
+                                                       std::string_view name_lc) {
+    if (open_tag.size() < 2 || open_tag[0] != '<') return std::nullopt;
+    size_t i = 1;
+    const size_t n = open_tag.size();
+    while (i < n && is_tag_name_char(open_tag[i])) ++i;         // skip tag name
+
+    while (i < n) {
+        while (i < n && is_ws(open_tag[i])) ++i;
+        if (i >= n || open_tag[i] == '>' || open_tag[i] == '/') break;
+        const size_t ns = i;
+        while (i < n && !is_ws(open_tag[i]) && open_tag[i] != '=' &&
+               open_tag[i] != '>' && open_tag[i] != '/')
+            ++i;
+        const std::string_view name = open_tag.substr(ns, i - ns);
+        while (i < n && is_ws(open_tag[i])) ++i;
+        std::string_view value;
+        if (i < n && open_tag[i] == '=') {
+            ++i;
+            while (i < n && is_ws(open_tag[i])) ++i;
+            if (i < n && (open_tag[i] == '"' || open_tag[i] == '\'')) {
+                const char q = open_tag[i++];
+                const size_t vs = i;
+                while (i < n && open_tag[i] != q) ++i;
+                value = open_tag.substr(vs, i - vs);
+            } else {
+                const size_t vs = i;
+                while (i < n && !is_ws(open_tag[i]) && open_tag[i] != '>') ++i;
+                value = open_tag.substr(vs, i - vs);
+            }
+        }
+        if (ci_eq(name, name_lc)) return value;
+    }
+    return std::nullopt;
+}
+
+// Tags searched for tag-less selectors (e.g. `.product`).
+static bool is_default_candidate(const std::string& tag) {
+    static const std::unordered_set<std::string> kDefaults = {
+        "div", "span", "a", "p", "li", "tr", "td", "th",
+        "section", "article", "main", "table", "ul", "ol"
+    };
+    return kDefaults.count(tag) != 0;
+}
+
+std::vector<ExtractionEngine::Element> ExtractionEngine::find_elements(
+        const Document& doc, const std::string& html, const std::string& selector) {
+    const ParsedSelector ps = parse_selector(selector);
+
+    auto matches = [&](const Element& el) -> bool {
+        const std::string& tag = doc.tag_names[el.tag];
+        if (!ps.tag.empty()) {
+            if (tag != ps.tag) return false;
+        } else if (!is_default_candidate(tag)) {
+            return false;
+        }
+
+        // Attribute checks only run when needed, against the open tag alone.
+        if (ps.id.empty() && ps.classes.empty() && ps.attrs.empty()) return true;
+
+        const std::string_view open_tag(html.data() + el.open, el.open_gt - el.open + 1);
+
+        if (!ps.id.empty()) {
+            const auto v = find_attr_value(open_tag, "id");
+            if (!v || *v != ps.id) return false;
+        }
+        if (!ps.classes.empty()) {
+            const auto v = find_attr_value(open_tag, "class");
+            if (!v) return false;
+            for (const auto& cls : ps.classes) {
+                bool hit = false;
+                size_t i = 0;
+                while (i < v->size()) {
+                    while (i < v->size() && is_ws((*v)[i])) ++i;
+                    const size_t s = i;
+                    while (i < v->size() && !is_ws((*v)[i])) ++i;
+                    if (i > s && v->substr(s, i - s) == cls) { hit = true; break; }
+                }
+                if (!hit) return false;
+            }
+        }
+        for (const auto& as : ps.attrs) {
+            const auto v = find_attr_value(open_tag, as.name);
+            if (!v) return false;
+            if (as.has_value && *v != as.value) return false;
+        }
+        return true;
+    };
+
+    std::vector<Element> result;
+    for (const auto& el : doc.elements)
+        if (matches(el)) result.push_back(el);
+    return result;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Attribute / text extraction
 // ═══════════════════════════════════════════════════════════════════════════
 
-static std::string trim_str(const std::string& s) {
-    size_t start = 0, end = s.size();
-    while (start < end && std::isspace((unsigned char)s[start])) ++start;
-    while (end > start && std::isspace((unsigned char)s[end - 1])) --end;
-    return s.substr(start, end - start);
-}
-
-static std::string strip_tags(const std::string& html) {
-    std::string out;
-    out.reserve(html.size());
-    bool in_tag = false;
-    for (char c : html) {
-        if (c == '<') { in_tag = true; continue; }
-        if (c == '>') { in_tag = false; continue; }
-        if (!in_tag) out += c;
-    }
-    std::string collapsed;
-    bool last_space = false;
-    for (char c : out) {
-        if (std::isspace((unsigned char)c)) {
-            if (!last_space) collapsed += ' ';
-            last_space = true;
-        } else {
-            collapsed += c;
-            last_space = false;
-        }
-    }
-    return trim_str(collapsed);
-}
-
 std::optional<std::string> ExtractionEngine::extract_attribute(
-        const std::string& element_html, const std::string& attr) {
-    std::string lower_html = element_html;
-    for (auto& c : lower_html) c = (char)std::tolower((unsigned char)c);
+        std::string_view element_html, std::string_view attr) {
+    const std::string attr_lc = to_lower(attr);
+    const size_t n = element_html.size();
 
-    auto try_quoted = [&](char quote) -> std::optional<std::string> {
-        std::string needle = " " + attr + "=" + quote;
-        auto pos = lower_html.find(needle);
-        if (pos != std::string::npos) {
-            pos += needle.size();
-            auto end = lower_html.find(quote, pos);
-            if (end != std::string::npos)
-                return element_html.substr(pos, end - pos);
+    // Scan every tag (descendants included); first occurrence wins.
+    size_t i = 0;
+    while (i + 1 < n) {
+        const size_t lt = element_html.find('<', i);
+        if (lt == std::string_view::npos || lt + 1 >= n) break;
+        const char c1 = element_html[lt + 1];
+        if (c1 == '!' || c1 == '?' || c1 == '/' || !is_tag_name_start(c1)) {
+            i = lt + 1;
+            continue;
         }
-        return std::nullopt;
-    };
+        const size_t gt = find_tag_end(element_html, lt + 1);
+        if (gt == std::string_view::npos) break;
 
-    auto r = try_quoted('"');
-    if (r) return r;
-    r = try_quoted('\'');
-    if (r) return r;
-
-    // Unquoted: attr=value (ends at whitespace, >, or /)
-    std::string search = " " + attr + "=";
-    auto pos = lower_html.find(search);
-    if (pos != std::string::npos) {
-        pos += search.size();
-        auto end = element_html.find_first_of(" \t\n\r>/", pos);
-        if (end == std::string::npos) end = element_html.size();
-        return element_html.substr(pos, end - pos);
+        if (auto v = find_attr_value(element_html.substr(lt, gt - lt + 1), attr_lc))
+            return decode_entities(*v);
+        i = gt + 1;
     }
-
     return std::nullopt;
 }
 
-std::string ExtractionEngine::extract_text(const std::string& element_html) {
-    return strip_tags(element_html);
-}
+std::string ExtractionEngine::extract_text(std::string_view element_html) {
+    std::string out;
+    out.reserve(element_html.size());
+    bool pending_space = false;   // collapse runs of whitespace to one space
+    bool at_word_start = true;    // leading whitespace suppression
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Tag finding (CSS-selector-lite, no full DOM)
-// ═══════════════════════════════════════════════════════════════════════════
+    auto push_char = [&](char c) {
+        if (is_ws(c)) { pending_space = true; return; }
+        if (pending_space && !at_word_start) out += ' ';
+        pending_space = false;
+        at_word_start = false;
+        out += c;
+    };
 
-// Parsed selector components
-struct parsed_sel {
-    std::string tag;
-    std::string id;
-    std::vector<std::string> classes;
-    std::unordered_map<std::string, std::string> attrs;
-};
-
-static parsed_sel parse_selector(const std::string& sel) {
-    parsed_sel ps;
-    std::string s = sel;
-
-    auto hash_pos = s.find('#');
-    if (hash_pos != std::string::npos) {
-        auto end = s.find_first_of(".#[:space>+~", hash_pos + 1);
-        ps.id = s.substr(hash_pos + 1, end - hash_pos - 1);
-        s.erase(hash_pos, ps.id.size() + 1);
-    }
-
-    size_t pos = 0;
-    while ((pos = s.find('.', pos)) != std::string::npos) {
-        auto end = s.find_first_of(".#[]>+~ \t\n\r", pos + 1);
-        if (end == std::string::npos) {
-            ps.classes.push_back(s.substr(pos + 1));
-            s.erase(pos);  // erase from '.' to end
-            break;
-        } else {
-            ps.classes.push_back(s.substr(pos + 1, end - pos - 1));
-            s.erase(pos, end - pos + 1);
-        }
-        // pos stays at same index; next iteration finds next '.' from here
-    }
-
-    auto bracket = s.find('[');
-    std::string tag_part = (bracket != std::string::npos)
-        ? s.substr(0, bracket) : s;
-    tag_part.erase(0, tag_part.find_first_not_of(" \t\n\r>+~"));
-    tag_part.erase(tag_part.find_last_not_of(" \t\n\r>+~") + 1);
-    if (!tag_part.empty() && tag_part != ">" && tag_part != "+" && tag_part != "~")
-        ps.tag = tag_part;
-
-    pos = 0;
-    while ((pos = s.find('[', pos)) != std::string::npos) {
-        auto close = s.find(']', pos);
-        if (close == std::string::npos) break;
-        std::string ae = s.substr(pos + 1, close - pos - 1);
-        auto eq = ae.find('=');
-        if (eq != std::string::npos) {
-            std::string name  = ae.substr(0, eq);
-            std::string value = ae.substr(eq + 1);
-            if (value.size() >= 2 &&
-                ((value[0] == '"' && value.back() == '"') ||
-                 (value[0] == '\'' && value.back() == '\'')))
-                value = value.substr(1, value.size() - 2);
-            ps.attrs[name] = value;
-        } else {
-            ps.attrs[ae] = "";
-        }
-        pos = close + 1;
-    }
-    return ps;
-}
-
-static bool tag_matches(const std::string& open_tag, const parsed_sel& ps) {
-    if (!ps.tag.empty()) {
-        // Extract tag name from open_tag (e.g. "<div class=..." → "div")
-        auto gt = open_tag.find('>');
-        std::string tn = open_tag.substr(1, gt - 1);
-        tn.erase(0, tn.find_first_not_of(" \t\n\r"));
-        auto sp = tn.find(' ');
-        if (sp != std::string::npos) tn = tn.substr(0, sp);
-        if (tn != ps.tag) return false;
-    }
-    if (!ps.id.empty()) {
-        std::string search = "id=\"";
-        auto ip = open_tag.find(search);
-        if (ip == std::string::npos) search = "id='";
-        if (ip != std::string::npos) {
-            ip += 4;
-            auto ie = open_tag.find('"', ip);
-            if (ie != std::string::npos) {
-                std::string found_id = open_tag.substr(ip, ie - ip);
-                if (found_id != ps.id) return false;
+    const size_t n = element_html.size();
+    size_t i = 0;
+    while (i < n) {
+        const char c = element_html[i];
+        if (c == '<' && i + 1 < n) {
+            const char c1 = element_html[i + 1];
+            if (c1 == '!') {                                     // <!-- --> / <!doctype> / CDATA
+                if (element_html.compare(i + 2, 2, "--") == 0) {
+                    const size_t e = element_html.find("-->", i + 4);
+                    i = (e == std::string::npos) ? n : e + 3;
+                } else if (element_html.compare(i + 2, 7, "[CDATA[") == 0) {
+                    const size_t e = element_html.find("]]>", i + 9);
+                    // CDATA *content* is text, unlike comments:
+                    const size_t content_end = (e == std::string::npos) ? n : e;
+                    for (size_t k = i + 9; k < content_end; ++k) push_char(element_html[k]);
+                    i = (e == std::string::npos) ? n : e + 3;
+                } else {
+                    const size_t e = element_html.find('>', i + 2);
+                    i = (e == std::string::npos) ? n : e + 1;
+                }
+                continue;
             }
-        } else {
-            return false;
-        }
-    }
-    for (auto& cls : ps.classes) {
-        auto cp = open_tag.find("class=\"");
-        if (cp == std::string::npos) return false;
-        cp += 7;  // "class=\" is 7 chars: c-l-a-s-s-=-"
-        auto ce = open_tag.find('"', cp);
-        std::string found;
-        if (ce != std::string::npos)
-            found = open_tag.substr(cp, ce - cp);
-        std::istringstream iss(found);
-        std::string token;
-        bool found_cls = false;
-        while (iss >> token)
-            if (token == cls) { found_cls = true; break; }
-        if (!found_cls) return false;
-    }
-    return true;
-}
-
-static std::vector<std::pair<size_t, size_t>> find_tag_ranges(
-        const std::string& html, const std::string& tag_name) {
-    std::vector<std::pair<size_t, size_t>> ranges;
-    std::string lh = html;
-    for (auto& c : lh) c = (char)std::tolower((unsigned char)c);
-
-    std::string open_pat  = "<"  + tag_name;
-    std::string close_pat = "</" + tag_name;
-    std::vector<size_t> opens;
-    size_t search_from = 0;
-
-    while (true) {
-        auto op = lh.find(open_pat, search_from);
-        auto cp = lh.find(close_pat, search_from);
-        if (op == std::string::npos && cp == std::string::npos) break;
-
-        if (cp != std::string::npos &&
-            (op == std::string::npos || cp < op)) {
-            if (!opens.empty()) {
-                ranges.emplace_back(opens.back(), cp);
-                opens.pop_back();
+            if (c1 == '?') {
+                const size_t e = element_html.find('>', i + 2);
+                i = (e == std::string::npos) ? n : e + 1;
+                continue;
             }
-            search_from = cp + close_pat.size();
-        } else {
-            auto after = html.find('>', op);
-            if (after != std::string::npos && after > (int)op) {
-                std::string between = html.substr(op, after - op + 1);
-                if (between.find('/') == std::string::npos || between.back() != '/')
-                    opens.push_back(op);
+            const bool closing = c1 == '/';
+            const size_t name_start = i + 1 + (closing ? 1 : 0);
+            if (name_start < n && is_tag_name_start(element_html[name_start])) {
+                size_t j = name_start + 1;
+                while (j < n && is_tag_name_char(element_html[j])) ++j;
+                const size_t gt = find_tag_end(element_html, j);
+                if (gt == std::string::npos) break;             // unterminated: drop the rest
+                if (!closing) {
+                    // <script>/<style>: skip content entirely — it isn't text.
+                    const std::string tag =
+                        to_lower(std::string_view(element_html.data() + name_start, j - name_start));
+                    if (tag == "script" || tag == "style") {
+                        size_t k = gt;
+                        while (k > j && is_ws(element_html[k - 1])) --k;
+                        const bool self_closing = k > j && element_html[k - 1] == '/';
+                        if (!self_closing) {
+                            const std::string close_pat = "</" + tag;
+                            const size_t cp = find_ci(element_html, gt + 1, close_pat.c_str());
+                            if (cp == std::string::npos) { i = n; continue; }
+                            const size_t close_gt = find_tag_end(element_html, cp + 2 + tag.size());
+                            i = (close_gt == std::string::npos) ? n : close_gt + 1;
+                            continue;
+                        }
+                    }
+                }
+                i = gt + 1;
+                continue;
             }
-            search_from = op + 1;
+            // Stray '<' (not a tag): treated as literal text below.
         }
-    }
-    while (!opens.empty()) {
-        ranges.emplace_back(opens.back(), html.size());
-        opens.pop_back();
-    }
-    return ranges;
-}
-
-std::vector<ExtractionEngine::TagMatch> ExtractionEngine::find_elements(
-        const std::string& html, const std::string& selector) {
-
-    auto ps = parse_selector(selector);
-    std::vector<TagMatch> result;
-
-    std::vector<std::string> tags_to_search;
-    if (ps.tag.empty())
-        tags_to_search = {"div","span","a","p","li","tr","td","th",
-                          "section","article","main","table","ul","ol"};
-    else
-        tags_to_search = {ps.tag};
-
-    for (auto& tag : tags_to_search) {
-        auto ranges = find_tag_ranges(html, tag);
-        for (auto [open_pos, close_pos] : ranges) {
-            auto gt_pos = html.find('>', open_pos);
-            if (gt_pos == std::string::npos) continue;
-            std::string open_tag = html.substr(open_pos, gt_pos - open_pos + 1);
-
-            if (!tag_matches(open_tag, ps)) continue;
-
-            bool attr_ok = true;
-            for (auto& [aname, avalue] : ps.attrs) {
-                auto it = extract_attribute(open_tag, aname);
-                if (!it) { attr_ok = false; break; }
-                if (!avalue.empty() && *it != avalue) { attr_ok = false; break; }
+        if (c == '&') {
+            std::string decoded;
+            if (decode_entity(element_html, i, decoded)) {
+                for (char d : decoded) push_char(d);   // nbsp still collapses
+                continue;
             }
-            if (!attr_ok) continue;
-
-            std::string inner_html = html.substr(gt_pos + 1, close_pos - gt_pos - 1);
-            auto close_end = html.find('>', close_pos);
-            std::string close_tag = close_end != std::string::npos
-                ? html.substr(close_pos, close_end - close_pos + 1)
-                : html.substr(close_pos);
-
-            TagMatch tm;
-            tm.open_tag   = open_tag;
-            tm.inner_html = inner_html;
-            tm.close_tag  = close_tag;
-            tm.full       = open_tag + inner_html + close_tag;
-            tm.tag_name   = tag;
-            result.push_back(std::move(tm));
         }
+        push_char(element_html[i]);
+        ++i;
     }
-    return result;
+    // `pending_space` at end is simply dropped → trailing trim for free.
+    return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -342,22 +880,44 @@ std::vector<ExtractionEngine::TagMatch> ExtractionEngine::find_elements(
 // ═══════════════════════════════════════════════════════════════════════════
 
 static std::string urljoin(const std::string& base, const std::string& rel) {
-    if (rel.empty()) return base;
-    if (rel.find("://") != std::string::npos) return rel;
-    auto se = base.find("://");
-    if (se == std::string::npos) return rel;
-    auto ps = base.find('/', se + 3);
-    std::string scheme  = base.substr(0, se);
-    std::string host    = base.substr(se + 3, (ps != std::string::npos ? ps - se - 3 : std::string::npos));
-    std::string base_path = ps != std::string::npos ? base.substr(ps) : "/";
+    if (rel.empty())  return base;
+    if (base.empty()) return rel;
+    if (rel.find("://") != std::string::npos) return rel;      // absolute
 
-    if (rel[0] == '/') return scheme + "://" + host + rel;
+    const size_t se = base.find("://");
+    if (se == std::string::npos) return rel;                   // base not absolute
+    const std::string_view scheme(base.data(), se);
+    const size_t ps = base.find('/', se + 3);                  // path start
+    const std::string host = base.substr(
+        se + 3, ps == std::string::npos ? std::string::npos : ps - se - 3);
 
-    auto ls = base_path.rfind('/');
-    std::string parent = (ls != std::string::npos) ? base_path.substr(0, ls + 1) : "/";
-    std::string encoded;
-    for (char c : rel) encoded += (c == ' ') ? "%20" : std::string(1, c);
-    return scheme + "://" + host + parent + encoded;
+    if (rel.compare(0, 2, "//") == 0) {                        // protocol-relative
+        std::string out;
+        out.reserve(se + 1 + rel.size());
+        out.append(scheme).append(":").append(rel);
+        return out;
+    }
+    if (rel[0] == '/') {                                       // root-relative
+        std::string out;
+        out.reserve(se + 3 + host.size() + rel.size());
+        out.append(scheme).append("://").append(host).append(rel);
+        return out;
+    }
+
+    // Document-relative: resolve against the base directory.
+    const std::string_view base_path =
+        ps == std::string::npos ? std::string_view("/") : std::string_view(base).substr(ps);
+    const size_t ls = base_path.rfind('/');
+    const std::string_view parent = base_path.substr(0, ls + 1);
+
+    std::string out;
+    out.reserve(se + 3 + host.size() + parent.size() + rel.size());
+    out.append(scheme).append("://").append(host).append(parent);
+    for (char c : rel) {
+        if (c == ' ') out += "%20";                            // minimal escaping
+        else          out += c;
+    }
+    return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -370,38 +930,42 @@ json ExtractionEngine::apply_transforms(
         const std::string& base_url) {
     json out = json::array();
 
-    // Determine the target type from the last transform
-    std::string last_transform;
-    if (!rule.transform.empty())
-        last_transform = rule.transform.back();
+    // A trailing int/float conversion determines the JSON value type.
+    const bool to_int   = !rule.transform.empty() && rule.transform.back() == "int";
+    const bool to_float = !rule.transform.empty() && rule.transform.back() == "float";
 
-    for (auto v : values) {
-        for (auto& t : rule.transform) {
-            if      (t == "trim")        v = trim_str(v);
-            else if (t == "lowercase")   for (auto& c : v) c = (char)std::tolower((unsigned char)c);
-            else if (t == "uppercase")   for (auto& c : v) c = (char)std::toupper((unsigned char)c);
-            else if (t == "urljoin")     v = urljoin(base_url, v);
+    for (const auto& raw : values) {
+        std::string v = raw;
+        bool ok = true;
+        for (const auto& t : rule.transform) {
+            if      (t == "trim")      v = trim_str(v);
+            else if (t == "lowercase") { for (auto& c : v) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a'); }
+            else if (t == "uppercase") { for (auto& c : v) if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A'); }
+            else if (t == "urljoin")   v = urljoin(base_url, v);
             else if (t == "int") {
-                try { v = std::to_string(std::stoi(v)); } catch (...) { v = "null"; }
+                try { v = std::to_string(std::stoll(v)); }
+                catch (...) { ok = false; break; }
             }
             else if (t == "float") {
-                try { v = std::to_string(std::stod(v)); } catch (...) { v = "null"; }
+                try { v = std::to_string(std::stod(v)); }
+                catch (...) { ok = false; break; }
             }
             else if (t == "regex_sub" && rule.regex_sub) {
-                auto re = make_regex(rule.regex.value_or(""));
+                const auto& re = compiled_regex(rule.regex.value_or(""), "regex_sub");
                 v = std::regex_replace(v, re, *rule.regex_sub);
             }
         }
-        if (v == "null") {
-            out.push_back(nullptr);
-        } else if (last_transform == "int") {
-            try { out.push_back(std::stoll(v)); }
+
+        if (!ok) {
+            out.push_back(nullptr);            // failed int/float conversion → null
+        } else if (to_int) {
+            try   { out.push_back(std::stoll(v)); }
             catch (...) { out.push_back(nullptr); }
-        } else if (last_transform == "float") {
-            try { out.push_back(std::stod(v)); }
+        } else if (to_float) {
+            try   { out.push_back(std::stod(v)); }
             catch (...) { out.push_back(nullptr); }
         } else {
-            out.push_back(v);
+            out.push_back(std::move(v));
         }
     }
     return out;
@@ -412,18 +976,18 @@ json ExtractionEngine::apply_transforms(
 // ═══════════════════════════════════════════════════════════════════════════
 
 json ExtractionEngine::apply_aggregate(const json& transformed,
-                                        const ExtractRule& rule,
-                                        size_t raw_count) {
+                                       const ExtractRule& rule,
+                                       size_t raw_count) {
     if (!rule.aggregate) return transformed;
 
-    auto& agg = *rule.aggregate;
+    const auto& agg = *rule.aggregate;
 
-    if (agg == "count")   return static_cast<int>(raw_count);
-    if (agg == "exists")  return raw_count > 0;
+    if (agg == "count")  return static_cast<long long>(raw_count);
+    if (agg == "exists") return raw_count > 0;
 
     if (agg == "first") {
         if (transformed.size() == 0) return json(nullptr);
-        return transformed[0];  // returns typed json value
+        return transformed[0];
     }
     if (agg == "last") {
         if (transformed.size() == 0) return json(nullptr);
@@ -434,7 +998,7 @@ json ExtractionEngine::apply_aggregate(const json& transformed,
         std::set<std::string> seen;
         json result = json::array();
         for (size_t i = 0; i < transformed.size(); ++i) {
-            std::string val = transformed[i].is_string()
+            const std::string val = transformed[i].is_string()
                 ? transformed[i].get_string()
                 : transformed[i].dump();
             if (seen.insert(val).second)
@@ -444,7 +1008,7 @@ json ExtractionEngine::apply_aggregate(const json& transformed,
     }
 
     if (agg == "join") {
-        std::string sep = rule.join_sep.value_or("");
+        const std::string sep = rule.join_sep.value_or("");
         std::string joined;
         for (size_t i = 0; i < transformed.size(); ++i) {
             if (i) joined += sep;
@@ -463,7 +1027,7 @@ json ExtractionEngine::apply_aggregate(const json& transformed,
 // ═══════════════════════════════════════════════════════════════════════════
 
 json ExtractionEngine::extract_leaf(const SubQuery& sub,
-                                    const std::string& element_html,
+                                    std::string_view element_html,
                                     const std::string& base_url) {
     const auto& rule = sub.rule;
     std::vector<std::string> raw;
@@ -471,27 +1035,19 @@ json ExtractionEngine::extract_leaf(const SubQuery& sub,
     if (rule.text) {
         raw = {extract_text(element_html)};
     } else if (rule.attribute) {
-        auto val = extract_attribute(element_html, *rule.attribute);
-        if (val) raw = {*val};
+        if (auto val = extract_attribute(element_html, *rule.attribute))
+            raw = {std::move(*val)};
     } else if (rule.regex) {
-        int groups = 0;
-        bool escaped = false;
-        for (char ch : *rule.regex) {
-            if (escaped) { escaped = false; continue; }
-            if (ch == '\\') { escaped = true; continue; }
-            if (ch == '(') ++groups;
-        }
-        auto caps = regex_find_captures(element_html, *rule.regex, groups);
-        if (groups >= 1) {
-            for (auto& c : caps)
-                if (c.size() > 1) raw.push_back(c[1]);
-        } else {
-            for (auto& c : caps) raw.push_back(c[0]);
-        }
+        // Pull the first capture group when present, else the whole match.
+        const auto& re = compiled_regex(*rule.regex, "rule");
+        const size_t pick = count_capture_groups(*rule.regex) >= 1 ? 1 : 0;
+        scan_matches(element_html, *rule.regex, re, [&](const sv_match& m) {
+            raw.push_back(m.size() > pick ? m.str(pick) : m.str(0));
+        });
     }
 
     if (raw.empty()) {
-        if (rule.optional) return json(nullptr);
+        if (rule.optional)  return json(nullptr);
         if (rule.aggregate) return apply_aggregate(json::array(), rule, 0);
         return json::array();
     }
@@ -510,35 +1066,66 @@ std::vector<Record> ExtractionEngine::execute(
         const std::string& base_url) {
 
     std::vector<Record> all_records;
+    std::optional<Document> doc;                 // built on first selector query
 
-    for (auto& [qname, query] : cfg.queries) {
-        if (query.xpath) continue;
+    // Cross-element aggregation helper: pure collection-level aggregates
+    // (count/exists with no extraction fields) are answered directly from the
+    // element list, and `exists` merges as "any element yielded a value"
+    // rather than re-running a generic aggregate over per-element booleans.
+    auto merge_into_record =
+        [this](Record& merged, const SubQuery& sub,
+               const std::vector<Record>& per_element, size_t element_count) {
+        const auto& rule = sub.rule;
+        const std::string agg = rule.aggregate.value_or("");
+        const bool no_extraction = !rule.text && !rule.attribute && !rule.regex;
 
-        if (query.regex) {
-            // Count capturing groups: '(' not preceded by '\'
-            int groups = 0;
-            bool escaped = false;
-            for (char ch : *query.regex) {
-                if (escaped) {
-                    escaped = false;
-                    continue;
-                }
-                if (ch == '\\') {
-                    escaped = true;
-                    continue;
-                }
-                if (ch == '(') ++groups;
+        if (agg == "count" && no_extraction && rule.transform.empty()) {
+            merged[sub.name] = static_cast<long long>(element_count);
+            return;
+        }
+        if (agg == "exists" && no_extraction && rule.transform.empty()) {
+            merged[sub.name] = element_count > 0;
+            return;
+        }
+
+        // Collect all values for this field across all elements.
+        json all_values = json::array();
+        for (const auto& rec : per_element) {
+            auto it = rec.find(sub.name);
+            if (it == rec.end()) continue;
+            const auto& val = it->second;
+            if (val.is_array()) {
+                for (size_t i = 0; i < val.size(); ++i)
+                    all_values.push_back(val[i]);
+            } else {
+                all_values.push_back(val);
             }
-            auto caps = regex_find_captures(html, *query.regex, groups);
-            for (auto& c : caps) {
-                std::string element_text;
-                if (groups >= 1 && c.size() > 1)
-                    element_text = c[1];
-                else
-                    element_text = c[0];
+        }
+        if (agg == "exists") {                   // any element yielded a value
+            bool any = false;
+            for (size_t i = 0; i < all_values.size(); ++i) {
+                const json& v = all_values[i];
+                any |= v.is_null() ? false : (v.is_bool() ? v.get_bool() : true);
+            }
+            merged[sub.name] = any;
+            return;
+        }
+        merged[sub.name] = apply_aggregate(all_values, rule, all_values.size());
+    };
+
+    for (const auto& [qname, query] : cfg.queries) {
+        if (query.xpath) continue;               // XPath requires a full DOM — unsupported here
+
+        // ── Raw-regex query ────────────────────────────────────────────────
+        if (query.regex) {
+            const auto& re = compiled_regex(*query.regex, "query");
+            const size_t pick = count_capture_groups(*query.regex) >= 1 ? 1 : 0;
+            scan_matches(html, *query.regex, re, [&](const sv_match& m) {
+                const std::string element_text =
+                    m.size() > pick ? m.str(pick) : m.str(0);
 
                 Record rec;
-                for (auto& sub : query.extract) {
+                for (const auto& sub : query.extract) {
                     if (sub.rule.regex) {
                         auto matches = regex_find_all(element_text, *sub.rule.regex);
                         if (matches.empty()) {
@@ -553,69 +1140,44 @@ std::vector<Record> ExtractionEngine::execute(
                     }
                 }
                 all_records.push_back(std::move(rec));
-            }
+            });
             continue;
         }
 
-        // ── Selector-based query ─────────────────────────────────────────────
-        auto elements = find_elements(html, query.selector);
+        // ── Selector-based query ───────────────────────────────────────────
+        if (!doc) doc = parse_document(html);
+        auto elements = find_elements(*doc, html, query.selector);
 
-        // Check if any extract has an aggregate
-        bool has_aggregate = false;
-        for (auto& sub : query.extract)
-            if (sub.rule.aggregate) { has_aggregate = true; break; }
+        const bool has_aggregate =
+            std::any_of(query.extract.begin(), query.extract.end(),
+                        [](const SubQuery& s) { return s.rule.aggregate.has_value(); });
+
+        const std::string_view html_v(html);
 
         if (has_aggregate && query.multiple) {
-            // Cross-element aggregate: collect all raw matches, then aggregate
+            // Cross-element aggregate: per-element extraction, then merge.
             std::vector<Record> per_element;
             per_element.reserve(elements.size());
-
-            for (auto& el : elements) {
+            for (const auto& el : elements) {
                 Record rec;
-                for (auto& sub : query.extract)
-                    rec[sub.name] = extract_leaf(sub, el.full, base_url);
+                for (const auto& sub : query.extract)
+                    rec[sub.name] = extract_leaf(
+                        sub, html_v.substr(el.open, el.end - el.open), base_url);
                 per_element.push_back(std::move(rec));
             }
 
-            // Merge into one record
             Record merged;
-            for (auto& sub : query.extract) {
-                auto& rule = sub.rule;
-
-                // Pure count with no extraction fields: count elements directly
-                if (rule.aggregate.value_or("") == "count" &&
-                    !rule.text && !rule.attribute &&
-                    !rule.regex && rule.transform.empty())
-                {
-                    merged[sub.name] = static_cast<int>(elements.size());
-                    continue;
-                }
-
-                // Collect all values for this field across all elements
-                json all_values = json::array();
-                for (auto& rec : per_element) {
-                    auto it = rec.find(sub.name);
-                    if (it != rec.end()) {
-                        auto& val = it->second;
-                        if (val.is_array()) {
-                            for (size_t i = 0; i < val.size(); ++i)
-                                all_values.push_back(val[i]);
-                        } else {
-                            all_values.push_back(val);
-                        }
-                    }
-                }
-                merged[sub.name] = apply_aggregate(all_values, rule, all_values.size());
-            }
+            for (const auto& sub : query.extract)
+                merge_into_record(merged, sub, per_element, elements.size());
             all_records.push_back(std::move(merged));
         } else {
-            if (!query.multiple)
-                elements.resize(std::min(elements.size(), (size_t)1));
-
-            for (auto& el : elements) {
+            if (!query.multiple && elements.size() > 1)
+                elements.resize(1);
+            for (const auto& el : elements) {
                 Record rec;
-                for (auto& sub : query.extract)
-                    rec[sub.name] = extract_leaf(sub, el.full, base_url);
+                for (const auto& sub : query.extract)
+                    rec[sub.name] = extract_leaf(
+                        sub, html_v.substr(el.open, el.end - el.open), base_url);
                 all_records.push_back(std::move(rec));
             }
         }
@@ -628,7 +1190,7 @@ json ExtractionEngine::execute_scalar(const CollectionQuery& query,
                                       const std::string& html) {
     if (query.extract.empty()) return json(nullptr);
     json rec = json::object();
-    for (auto& sub : query.extract)
+    for (const auto& sub : query.extract)
         rec[sub.name] = extract_leaf(sub, html, "");
     return rec;
 }

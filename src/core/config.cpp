@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <iostream>
+#include <unordered_set>
 
 namespace bullet_scrape {
 
@@ -260,8 +261,16 @@ void ScraperConfig::expand_urls() {
         for (auto& u : url_list) all_urls.push_back(u);
     }
 
-    std::sort(all_urls.begin(), all_urls.end());
-    all_urls.erase(std::unique(all_urls.begin(), all_urls.end()), all_urls.end());
+    // Deduplicate while preserving declaration order (page 2 must not end up
+    // behind page 10 — a lexicographic sort would scramble pagination).
+    std::unordered_set<std::string> seen;
+    seen.reserve(all_urls.size());
+    std::vector<std::string> ordered;
+    ordered.reserve(all_urls.size());
+    for (auto& u : all_urls)
+        if (seen.insert(u).second)
+            ordered.push_back(std::move(u));
+    all_urls = std::move(ordered);
 }
 
 } // namespace bullet_scrape

@@ -10,7 +10,6 @@
 #include <mutex>
 #include <condition_variable>
 #include <future>
-#include <csignal>
 
 namespace bullet_scrape {
 
@@ -21,13 +20,7 @@ struct Scraper::Impl {
     std::unique_ptr<HTTPClient> client;
     std::atomic<bool>         cancelled{false};
 
-    Impl() {
-        struct sigaction sa{};
-        sa.sa_handler = +[](int) { /* flag set via atomic in production */ };
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = 0;
-        sigaction(SIGINT, &sa, nullptr);
-    }
+    Impl() = default;
 
     ScrapeResult run_impl() {
         ScrapeResult result;

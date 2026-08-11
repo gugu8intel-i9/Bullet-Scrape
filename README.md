@@ -166,8 +166,17 @@ No DOM tree is built. Queries are resolved by scanning raw HTML bytes.
 | `.price` | Class |
 | `#main` | ID |
 | `div.product` | Tag + class |
+| `div.card.featured` | Tag + multiple classes |
 | `a[href]` | Tag with attribute presence |
-| `a[href="/p/1"]` | Tag with attribute value |
+| `a[href="/p/1"]` | Tag with attribute value (single or double quotes) |
+
+Selectors are matched against a **single-pass, quote-aware document index** —
+no DOM is built. The scanner handles quoted `>` inside attributes, comments,
+`<script>`/`<style>` raw-text content (JS strings never leak into matches),
+void and self-closing tags, and browser-style implied end tags (`<li>` without
+`</li>`, `<p>` closed by a block element, …). Text extraction decodes HTML
+entities and collapses whitespace. For compound selectors (`div.card > a`),
+the rightmost simple segment is used.
 
 ### Tier 2 — XPath (opt-in)
 
@@ -294,7 +303,7 @@ Shared library: `make shared` → `libbullet_scrape.so`.
 
 | Path | Typical cost |
 |---|---|
-| Regex extract, ~90 KB / 500 nodes | ~2–3 ms / page (bench) |
+| Regex extract, ~90 KB / 500 nodes | ~1.3 ms / page (bench) |
 | Offline Python `bs.extract` same page | ~280 pages/s process throughput |
 | DOM + XPath | 5–15 ms (tree size dependent) |
 | Network | Dominates real scrapes — raise `max_concurrent` |
@@ -305,8 +314,9 @@ Shared library: `make shared` → `libbullet_scrape.so`.
 2. **Thread-local curl easy handles** — keep-alive + HTTP/2 with no lock on the fetch hot path.
 3. **Token-bucket rate limiter** — optional global `requests_per_second`.
 4. **Thread-safe regex cache** (`shared_mutex`) — compile once, share across workers.
-5. **Zero-DOM default** — scan raw HTML bytes; XPath is opt-in.
-6. **Colab build flags** — `-O3 -ffast-math -funroll-loops -march=x86-64-v2`.
+5. **Literal-prefix regex anchoring** — patterns with a literal start (e.g. `class="`) are seeded with `memchr`+`memcmp` and only verified anchored by the regex engine, instead of letting the backtracking NFA re-scan every byte.
+6. **Zero-DOM default** — scan raw HTML bytes; XPath is opt-in. The tier-1.5 tag index is a single pass over the document: interned tag names (no per-tag string copies), POD element spans (extraction reads `string_view`s into the page), one shared index for all selector queries on a page.
+7. **Colab build flags** — `-O3 -ffast-math -funroll-loops -march=x86-64-v2`.
 
 ```python
 import os, bullet_scrape as bs
